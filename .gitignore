@@ -2,6 +2,10 @@
 node_modules/
 __pycache__/
 .pytest_cache/
+data/
+data_test/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
 .env
 .env.*
 *.pem
