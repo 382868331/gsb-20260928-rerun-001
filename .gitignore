@@ -6,3 +6,7 @@ __pycache__/
 .env.*
 *.pem
 *.key
+media/
+projects/
+exports/
+frontend/dist/
