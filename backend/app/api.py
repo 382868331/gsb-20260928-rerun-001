@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from . import media as media_service
-from .config import MEDIA_DIR, ensure_dirs
+from .config import MEDIA_DIR, STAGING_DIR, ensure_dirs
 from .exporter import manager as export_manager
 from .models import Project, ProjectPayload
 from .samples import ensure_samples
@@ -56,7 +56,12 @@ def upload_media(file: UploadFile = File(...)) -> dict:
     suffix = Path(file.filename or "clip.mp4").suffix.lower()
     if not re.fullmatch(r"\.[a-z0-9]{2,5}", suffix):
         suffix = ".mp4"
-    staging = MEDIA_DIR.parent / f"upload_{uuid.uuid4().hex}{suffix}"
+    # The staging area is a dedicated directory that is created on
+    # demand. A first-ever upload works even if the data root is empty
+    # and no other endpoint (sample generation, project creation) has
+    # run before this check.
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    staging = STAGING_DIR / f"upload_{uuid.uuid4().hex}{suffix}"
     try:
         content = file.file.read()
         staging.write_bytes(content)

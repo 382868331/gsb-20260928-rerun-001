@@ -13,6 +13,12 @@ class Clip(BaseModel):
     # Source range in seconds, inclusive start / exclusive end.
     source_in: float = Field(ge=0)
     source_out: float = Field(gt=0)
+    # Independent playback gain for this clip (0 = muted).
+    volume: float = Field(default=1.0, ge=0, le=4)
+    # Length of the crossfade overlap *into* this clip from the
+    # previous one. 0 means a hard cut; clips overlap on the timeline
+    # while video/audio crossfade during the overlap.
+    transition: float = Field(default=0.0, ge=0)
 
     @field_validator("source_out")
     @classmethod
@@ -53,9 +59,14 @@ class TimelineClip(BaseModel):
     media_id: str
     start: float  # position on the unified timeline
     end: float
+    # This clip's media also plays (fading in) before ``start``; during
+    # [start, start + transition] it is crossfaded with the previous clip.
+    transition_start: float
+    transition: float
     duration: float
     source_in: float
     source_out: float
+    volume: float
     media_missing: bool
     source_duration: float | None
 
