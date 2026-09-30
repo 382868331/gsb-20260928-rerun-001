@@ -117,10 +117,7 @@ class ExportManager:
 
             work_dir.mkdir(parents=True, exist_ok=True)
             info.status = "running"
-            segments = self._render_segments(job, timeline, media_index, work_dir)
-            if job.cancel_event.is_set():
-                raise RuntimeError("导出已取消")
-            self._concat(segments, work_dir, final_path, job)
+            self._render_timeline(job, timeline, media_index, final_path)
             if job.cancel_event.is_set():
                 raise RuntimeError("导出已取消")
             info.status = "done"
@@ -144,90 +141,117 @@ class ExportManager:
             atomic_write_json(EXPORTS_DIR / f"{info.id}.json", info.model_dump())
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    def _render_segments(
+    def _render_timeline(
         self,
         job: _Job,
         timeline: Timeline,
         media_index: dict[str, MediaInfo],
-        work_dir: Path,
-    ) -> list[Path]:
-        segments: list[Path] = []
-        total = timeline.duration or 1.0
-        done_before = 0.0
-        for index, clip in enumerate(timeline.clips):
-            if job.cancel_event.is_set():
-                break
-            source = media_path(clip.media_id)
-            if not source.exists():
-                raise RuntimeError(f"素材缺失：{clip.media_id}")
-            output = work_dir / f"segment_{index:04d}.mp4"
-            self._render_one(
-                job,
-                source,
-                clip.source_in,
-                clip.duration,
-                output,
-                media_index[clip.media_id].has_audio,
-            )
-            segments.append(output)
-            done_before += clip.duration
-            job.info.progress = min(0.99, round(0.95 * done_before / total, 4))
-        return segments
-
-    def _render_one(
-        self,
-        job: _Job,
-        source: Path,
-        source_in: float,
-        duration: float,
-        output: Path,
-        has_audio: bool,
+        final_path: Path,
     ) -> None:
-        # Precise trim/atrim in one filter graph slices video and audio
-        # by the same PTS interval; anullsrc fills clips without audio
-        # so every segment has an identical stream layout for concat.
-        video_chain = (
-            f"[0:v]trim=start={source_in:.6f}:duration={duration:.6f},"
-            "setpts=PTS-STARTPTS,"
-            f"fps={OUTPUT_FPS},"
-            f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
-            f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black,"
-            "format=yuv420p[v]"
-        )
-        if has_audio:
-            audio_chain = (
-                f"[0:a]atrim=start={source_in:.6f}:duration={duration:.6f},"
-                "asetpts=PTS-STARTPTS,"
-                f"aresample={OUTPUT_AUDIO_RATE},"
-                "apad=whole_dur={:.6f}[a]".format(duration)
-            )
-        else:
-            audio_chain = (
-                f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={duration:.6f}[a]"
-            )
-        cmd = [
+        cmd: list[str] = [
             "ffmpeg",
             "-y",
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(source),
         ]
-        if not has_audio:
+        filters: list[str] = []
+        silent_inputs: list[int] = []
+
+        for index, clip in enumerate(timeline.clips):
+            source = media_path(clip.media_id)
+            if not source.exists():
+                raise RuntimeError(f"素材缺失：{clip.media_id}")
+            cmd += ["-i", str(source)]
+            if not media_index[clip.media_id].has_audio:
+                silent_inputs.append(index)
+
+        next_input = len(timeline.clips)
+        silent_labels: dict[int, str] = {}
+        for clip_index in silent_inputs:
+            label = f"silent{clip_index}"
             cmd += [
                 "-f",
                 "lavfi",
                 "-i",
-                f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={duration:.6f}",
+                f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={timeline.clips[clip_index].duration:.6f}",
             ]
+            filters.append(f"[{next_input}:a]anull[{label}]")
+            silent_labels[clip_index] = label
+            next_input += 1
+
+        for index, clip in enumerate(timeline.clips):
+            video_filter = (
+                f"[{index}:v]trim=start={clip.source_in:.6f}:duration={clip.duration:.6f},"
+                "setpts=PTS-STARTPTS,"
+                f"fps={OUTPUT_FPS},"
+                f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
+                f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black,"
+                "format=yuv420p"
+            )
+            audio_source = (
+                f"[{silent_labels[index]}]"
+                if index in silent_labels
+                else f"[{index}:a]"
+            )
+            audio_filter = (
+                f"{audio_source}atrim=start={clip.source_in:.6f}:duration={clip.duration:.6f},"
+                "asetpts=PTS-STARTPTS,"
+                f"aresample={OUTPUT_AUDIO_RATE},"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates={},"
+                .format(OUTPUT_AUDIO_RATE)
+            )
+            volume = max(0.0, min(4.0, clip.volume))
+            if volume != 1.0:
+                video_filter += f",fade=t=in:st=0:d=0,volume={volume:.6f}"
+                audio_filter += f"volume={volume:.6f},"
+            if clip.transition > 0:
+                fade_out_start = max(0.0, clip.duration - clip.transition)
+                video_filter += (
+                    f",fade=t=out:st={fade_out_start:.6f}:d={clip.transition:.6f}"
+                )
+                audio_filter += (
+                    f"afade=t=out:st={fade_out_start:.6f}:d={clip.transition:.6f},"
+                )
+            if index > 0 and timeline.clips[index].transition > 0:
+                fade_in_duration = timeline.clips[index].transition
+                video_filter += f",fade=t=in:st=0:d={fade_in_duration:.6f}"
+                audio_filter += f"afade=t=in:st=0:d={fade_in_duration:.6f},"
+            audio_filter += f"apad=whole_dur={clip.duration:.6f}"
+            filters.append(f"{video_filter}[v{index}]")
+            filters.append(f"{audio_filter}[a{index}]")
+
+        video_label = "v0"
+        audio_label = "a0"
+        for index in range(1, len(timeline.clips)):
+            clip = timeline.clips[index]
+            next_video = f"vx{index}"
+            next_audio = f"ax{index}"
+            if clip.transition > 0:
+                filters.append(
+                    f"[{video_label}][v{index}]xfade=transition=fade:"
+                    f"offset={clip.transition_start:.6f}:duration={clip.transition:.6f}[{next_video}]"
+                )
+                filters.append(
+                    f"[{audio_label}][a{index}]acrossfade=d={clip.transition:.6f}:"
+                    f"c1=tri:c2=tri[{next_audio}]"
+                )
+            else:
+                filters.append(
+                    f"[{video_label}][v{index}]concat=n=2:v=1:a=0[{next_video}]"
+                )
+                filters.append(
+                    f"[{audio_label}][a{index}]concat=n=2:v=0:a=1[{next_audio}]"
+                )
+            video_label, audio_label = next_video, next_audio
+
         cmd += [
             "-filter_complex",
-            f"{video_chain};{audio_chain}",
+            ";".join(filters),
             "-map",
-            "[v]",
+            f"[{video_label}]",
             "-map",
-            "[a]",
+            f"[{audio_label}]",
             "-c:v",
             "libx264",
             "-preset",
@@ -237,39 +261,11 @@ class ExportManager:
             "-b:a",
             "128k",
             "-t",
-            f"{duration:.6f}",
-            str(output),
-        ]
-        self._run_process(job, cmd)
-
-    def _concat(
-        self, segments: list[Path], work_dir: Path, final_path: Path, job: _Job
-    ) -> None:
-        list_file = work_dir / "concat.txt"
-        lines = []
-        for segment in segments:
-            escaped = str(segment).replace("'", "'\\''")
-            lines.append(f"file '{escaped}'")
-        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        # Identical codec parameters across segments -> stream-copy concat
-        # keeps exact boundaries without a second encode.
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c",
-            "copy",
+            f"{timeline.duration:.6f}",
             str(final_path),
         ]
         self._run_process(job, cmd)
+        job.info.progress = 0.99
 
     def _run_process(self, job: _Job, cmd: list[str]) -> None:
         process = subprocess.Popen(

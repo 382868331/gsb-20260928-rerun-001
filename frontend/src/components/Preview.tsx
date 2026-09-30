@@ -1,8 +1,26 @@
 import { useEffect, useRef, useState } from "react";
-import { Pause, Play, SkipBack } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Pause,
+  Play,
+  Repeat,
+  SkipBack,
+} from "lucide-react";
 import { api } from "../api";
 import type { Timeline, TimelineClip } from "../types";
 import { useEditor } from "../store";
+
+const PLAYBACK_FPS = 30;
+const AUDITION_PAD = 0.5;
+
+interface LayerState {
+  video: HTMLVideoElement | null;
+  source: MediaElementAudioSourceNode | null;
+  gain: GainNode | null;
+  url: string;
+  loadToken: number;
+}
 
 function formatTime(seconds: number): string {
   const safe = Math.max(0, seconds);
@@ -11,150 +29,233 @@ function formatTime(seconds: number): string {
   return `${minutes}:${secs}`;
 }
 
-function clipAt(timeline: Timeline, time: number): TimelineClip | null {
-  return (
-    timeline.clips.find((clip) => time >= clip.start && time < clip.end) ??
-    timeline.clips[timeline.clips.length - 1] ??
-    null
+function activeClipsAt(timeline: Timeline, time: number): TimelineClip[] {
+  return timeline.clips.filter(
+    (clip) => time >= clip.transition_start - 1e-7 && time < clip.end,
   );
 }
 
 export function Preview() {
   const timeline = useEditor((state) => state.timeline);
-  const media = useEditor((state) => state.media);
-  const project = useEditor((state) => state.project);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const projectId = useEditor((state) => state.project?.id);
+  const selectedClipId = useEditor((state) => state.selectedClipId);
   const timeRef = useRef(0);
   const rafRef = useRef<number | null>(null);
-  const activeClipRef = useRef<string | null>(null);
+  const lastFrameRef = useRef(0);
+  const playingRef = useRef(false);
+  const loopRangeRef = useRef<{ start: number; end: number } | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const layersRef = useRef<LayerState[]>([
+    { video: null, source: null, gain: null, url: "", loadToken: 0 },
+    { video: null, source: null, gain: null, url: "", loadToken: 0 },
+  ]);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
-  const playingRef = useRef(false);
+  const [auditionClipId, setAuditionClipId] = useState<string | null>(null);
 
-  const mediaIndex = new Map(media.map((item) => [item.id, item]));
   const duration = timeline?.duration ?? 0;
 
-  useEffect(() => {
-    // Reset preview when the project structure changes materially.
-    timeRef.current = 0;
-    activeClipRef.current = null;
-    setPosition(0);
-    setPlaying(false);
+  const stopPlayback = () => {
     playingRef.current = false;
-  }, [project?.id]);
+    setPlaying(false);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    for (const layer of layersRef.current) layer.video?.pause();
+  };
+
+  const syncPreview = (time: number, shouldPlay: boolean) => {
+    if (!timeline) return;
+    const active = activeClipsAt(timeline, time);
+    configureLayer(layersRef.current[0], active[0], time, shouldPlay && active.length > 0);
+    configureLayer(layersRef.current[1], active[1], time, shouldPlay && active.length > 1);
+  };
 
   useEffect(() => {
-    return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
-  }, []);
+    stopPlayback();
+    loopRangeRef.current = null;
+    timeRef.current = 0;
+    setPosition(0);
+    setAuditionClipId(null);
+    syncPreview(0, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
 
-  const seekClipTo = (clip: TimelineClip, localOffset: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    const sourceTime = clip.source_in + localOffset;
-    if (Math.abs(video.currentTime - sourceTime) > 0.08) {
-      video.currentTime = sourceTime;
+  useEffect(() => {
+    const clamped = Math.min(timeRef.current, timeline?.duration ?? 0);
+    timeRef.current = clamped;
+    setPosition(clamped);
+    syncPreview(clamped, playingRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeline]);
+
+  useEffect(() => () => stopPlayback(), []);
+
+  const setLayerVideo = (index: number) => (video: HTMLVideoElement | null) => {
+    layersRef.current[index].video = video;
+  };
+
+  const ensureAudio = () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    if (audioContextRef.current.state === "suspended") {
+      void audioContextRef.current.resume();
+    }
+    for (const layer of layersRef.current) {
+      const video = layer.video;
+      if (!video || !audioContextRef.current || layer.source) continue;
+      video.muted = false;
+      layer.source = audioContextRef.current.createMediaElementSource(video);
+      layer.gain = audioContextRef.current.createGain();
+      layer.gain.gain.value = 0;
+      layer.source.connect(layer.gain);
+      layer.gain.connect(audioContextRef.current.destination);
     }
   };
 
-  const tick = () => {
-    const video = videoRef.current;
-    if (!timeline || !video) {
-      rafRef.current = requestAnimationFrame(tick);
+  const configureLayer = (
+    layer: LayerState,
+    clip: TimelineClip | undefined,
+    time: number,
+    shouldPlay: boolean,
+  ) => {
+    const video = layer.video;
+    if (!video) return;
+    if (!clip || clip.media_missing) {
+      video.pause();
+      if (layer.gain) layer.gain.gain.value = 0;
+      video.style.opacity = "0";
       return;
     }
-    const clip = clipAt(timeline, timeRef.current);
-    if (!clip) {
-      stop();
-      return;
-    }
-    if (timeRef.current >= timeline.duration - 0.005) {
-      stop();
-      setPosition(timeline.duration);
-      return;
-    }
-    const localOffset = Math.max(0, timeRef.current - clip.start);
-    if (activeClipRef.current !== clip.clip_id) {
-      activeClipRef.current = clip.clip_id;
-      const url = api.mediaStreamUrl(clip.media_id);
-      const item = mediaIndex.get(clip.media_id);
-      if (!item) {
-        // Missing media: advance clock silently (kept editable in timeline).
-      } else if (!video.src.endsWith(url)) {
-        video.src = url;
-      }
+
+    const url = api.mediaStreamUrl(clip.media_id);
+    const fade =
+      clip.transition > 0 && time < clip.start
+        ? Math.max(0, Math.min(1, (time - clip.transition_start) / clip.transition))
+        : 1;
+    if (layer.gain) layer.gain.gain.value = clip.volume * fade;
+    video.volume = 1;
+    video.style.opacity = String(fade);
+
+    const sourceTime = clip.source_in + Math.max(0, time - clip.transition_start);
+    if (layer.url !== url) {
+      layer.url = url;
+      const token = ++layer.loadToken;
+      video.src = url;
       video.load();
-      video.currentTime = clip.source_in + localOffset;
-      if (playingRef.current) void video.play().catch(() => undefined);
-    } else if (!clip.media_missing) {
-      seekClipTo(clip, localOffset);
+      video.onloadedmetadata = () => {
+        if (token === layer.loadToken) video.currentTime = sourceTime;
+      };
+    } else if (Math.abs(video.currentTime - sourceTime) > 0.08) {
+      video.currentTime = sourceTime;
     }
-    timeRef.current += 1 / 60;
-    setPosition(timeRef.current);
+    if (shouldPlay) void video.play().catch(() => undefined);
+    else video.pause();
+  };
+
+  const tick = (now: number) => {
+    if (!timeline) return;
+    const delta = Math.min(0.1, (now - lastFrameRef.current) / 1000 || 0);
+    lastFrameRef.current = now;
+    let nextTime = timeRef.current + delta;
+    const loopRange = loopRangeRef.current;
+    if (loopRange && nextTime >= loopRange.end) {
+      nextTime = loopRange.start;
+    } else if (nextTime >= timeline.duration - 1 / PLAYBACK_FPS) {
+      timeRef.current = timeline.duration;
+      setPosition(timeline.duration);
+      syncPreview(timeline.duration, false);
+      stopPlayback();
+      return;
+    }
+    timeRef.current = nextTime;
+    setPosition(nextTime);
+    syncPreview(nextTime, true);
     rafRef.current = requestAnimationFrame(tick);
   };
 
-  const start = () => {
+  const startPlayback = (loopRange: { start: number; end: number } | null = null) => {
     if (!timeline || timeline.duration === 0) return;
-    if (timeRef.current >= timeline.duration - 0.02) {
+    ensureAudio();
+    if (loopRange) {
+      timeRef.current = loopRange.start;
+      setPosition(loopRange.start);
+    } else if (timeRef.current >= timeline.duration - 0.02) {
       timeRef.current = 0;
-      activeClipRef.current = null;
+      setPosition(0);
     }
+    loopRangeRef.current = loopRange;
     playingRef.current = true;
     setPlaying(true);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    lastFrameRef.current = performance.now();
+    syncPreview(timeRef.current, true);
     rafRef.current = requestAnimationFrame(tick);
   };
 
-  const pause = () => {
-    playingRef.current = false;
-    setPlaying(false);
-    videoRef.current?.pause();
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-  };
-
-  const stop = () => {
-    playingRef.current = false;
-    setPlaying(false);
-    videoRef.current?.pause();
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+  const pausePlayback = () => {
+    stopPlayback();
+    syncPreview(timeRef.current, false);
   };
 
   const restart = () => {
-    stop();
+    setAuditionClipId(null);
+    loopRangeRef.current = null;
+    stopPlayback();
     timeRef.current = 0;
-    activeClipRef.current = null;
     setPosition(0);
+    syncPreview(0, false);
   };
 
   const scrub = (value: number) => {
-    stop();
+    setAuditionClipId(null);
+    loopRangeRef.current = null;
+    stopPlayback();
     timeRef.current = value;
-    activeClipRef.current = null; // force reload at new source offset
     setPosition(value);
-    // Render one frame synchronously.
-    rafRef.current = requestAnimationFrame(function once() {
-      const video = videoRef.current;
-      if (video && timeline) {
-        const clip = clipAt(timeline, value);
-        if (clip && !clip.media_missing) {
-          const url = api.mediaStreamUrl(clip.media_id);
-          if (!video.src.endsWith(url)) video.src = url;
-          video.currentTime = clip.source_in + (value - clip.start);
-        }
-      }
-    });
+    syncPreview(value, false);
   };
 
-  const currentClip = timeline ? clipAt(timeline, position) : null;
+  const stepFrame = (direction: -1 | 1) => {
+    setAuditionClipId(null);
+    loopRangeRef.current = null;
+    stopPlayback();
+    const value = Math.max(
+      0,
+      Math.min(duration, timeRef.current + direction / PLAYBACK_FPS),
+    );
+    timeRef.current = value;
+    setPosition(value);
+    syncPreview(value, false);
+  };
+
+  const auditionTransition = () => {
+    if (!timeline) return;
+    const selectedIndex = timeline.clips.findIndex((clip) => clip.clip_id === selectedClipId);
+    const incomingIndex = Math.max(
+      1,
+      selectedIndex > 0 ? selectedIndex : timeline.clips.findIndex((clip) => clip.transition > 0),
+    );
+    const incoming = timeline.clips[incomingIndex];
+    if (!incoming) return;
+    const start = Math.max(0, incoming.transition_start - AUDITION_PAD);
+    const end = Math.min(
+      timeline.duration,
+      incoming.start + incoming.transition + AUDITION_PAD,
+    );
+    setAuditionClipId(incoming.clip_id);
+    startPlayback({ start, end });
+  };
+
+  const currentClips = timeline ? activeClipsAt(timeline, position) : [];
   const missing = timeline?.missing_media_ids.length ?? 0;
 
   return (
     <section className="panel preview">
       <div className="preview-stage">
-        <video ref={videoRef} muted playsInline preload="auto" />
-        {currentClip?.media_missing && (
+        <video ref={setLayerVideo(0)} muted playsInline preload="auto" />
+        <video ref={setLayerVideo(1)} muted playsInline preload="auto" />
+        {currentClips.some((clip) => clip.media_missing) && (
           <div className="missing-badge">素材缺失，占位预览</div>
         )}
       </div>
@@ -163,20 +264,29 @@ export function Preview() {
           <SkipBack size={18} />
         </button>
         {playing ? (
-          <button type="button" onClick={pause} title="暂停">
+          <button type="button" onClick={pausePlayback} title="暂停">
             <Pause size={18} />
           </button>
         ) : (
-          <button type="button" onClick={start} title="播放">
+          <button type="button" onClick={() => startPlayback()} title="播放">
             <Play size={18} />
           </button>
         )}
+        <button type="button" onClick={() => stepFrame(-1)} title="上一帧">
+          <ChevronLeft size={18} />
+        </button>
+        <button type="button" onClick={() => stepFrame(1)} title="下一帧">
+          <ChevronRight size={18} />
+        </button>
+        <button type="button" onClick={auditionTransition} title="循环试听转场前后">
+          <Repeat size={18} />
+        </button>
         <input
           className="scrubber"
           type="range"
           min={0}
           max={Math.max(duration, 0.001)}
-          step={0.01}
+          step={1 / PLAYBACK_FPS}
           value={Math.min(position, duration)}
           onChange={(event) => scrub(Number(event.target.value))}
         />
@@ -184,6 +294,9 @@ export function Preview() {
           {formatTime(position)} / {formatTime(duration)}
         </span>
       </div>
+      {auditionClipId && (
+        <p className="hint">正在循环试听所选转场前后各 {AUDITION_PAD.toFixed(1)} 秒。</p>
+      )}
       {missing > 0 && (
         <p className="warning">
           有 {missing} 段素材缺失；补齐同名素材后即可恢复，工程仍可继续编辑。

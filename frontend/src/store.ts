@@ -13,24 +13,35 @@ export function computeLocalTimeline(
 ): Timeline {
   let cursor = 0;
   const missing = new Set<string>();
-  const result = clips.map((clip) => {
+  const result = clips.map((clip, index) => {
     const item = media[clip.media_id];
     if (!item) missing.add(clip.media_id);
-    const start = Math.round(cursor * 1e6) / 1e6;
     const duration = Math.max(0, clip.source_out - clip.source_in);
-    const end = Math.round((cursor + duration) * 1e6) / 1e6;
-    cursor = end;
+    let transition = index === 0 ? 0 : Math.min(Math.max(0, clip.transition || 0), duration * 0.5);
+    if (index > 0) {
+      const previous = clips[index - 1];
+      const previousDuration = Math.max(0, previous.source_out - previous.source_in);
+      transition = Math.min(transition, previousDuration * 0.5);
+    }
+    transition = Math.round(transition * 1e6) / 1e6;
+    const start = Math.round(cursor * 1e6) / 1e6;
+    const end = Math.round((start + duration) * 1e6) / 1e6;
+    const nextCursor = index === 0 ? end : Math.round(start + duration - transition, 6);
     return {
       clip_id: clip.id,
       media_id: clip.media_id,
       start,
       end,
+      transition_start: Math.round(start - transition, 6),
+      transition,
       duration: Math.round(duration * 1e6) / 1e6,
       source_in: clip.source_in,
       source_out: clip.source_out,
+      volume: Math.max(0, Math.min(4, clip.volume ?? 1)),
       media_missing: !item,
       source_duration: item?.duration ?? null,
     };
+    cursor = nextCursor;
   });
   return {
     duration: Math.round(cursor * 1e6) / 1e6,
@@ -60,6 +71,8 @@ interface EditorState {
   removeClip: (clipId: string) => void;
   moveClip: (clipId: string, direction: -1 | 1) => void;
   trimClip: (clipId: string, edge: "in" | "out", value: number) => void;
+  setClipVolume: (clipId: string, value: number) => void;
+  setClipTransition: (clipId: string, value: number) => void;
   renameProject: (name: string) => void;
   selectClip: (clipId: string | null) => void;
   startExport: () => Promise<void>;
@@ -165,6 +178,8 @@ export const useEditor = create<EditorState>((set, get) => ({
       media_id: mediaId,
       source_in: 0,
       source_out: Math.min(item.duration, Math.max(1, item.duration)),
+      volume: 1,
+      transition: 0,
     };
     const clips = [...project.clips, clip];
     patchClips(set, get, clips, clip.id, true);
@@ -209,6 +224,28 @@ export const useEditor = create<EditorState>((set, get) => ({
       }
       return next;
     });
+    patchClips(set, get, clips, clipId, false);
+  },
+
+  setClipVolume: (clipId, value) => {
+    const { project } = get();
+    if (!project) return;
+    const clips = project.clips.map((clip) =>
+      clip.id === clipId
+        ? { ...clip, volume: Math.max(0, Math.min(4, Math.round(value * 100) / 100)) }
+        : clip,
+    );
+    patchClips(set, get, clips, clipId, false);
+  },
+
+  setClipTransition: (clipId, value) => {
+    const { project } = get();
+    if (!project) return;
+    const clips = project.clips.map((clip) =>
+      clip.id === clipId
+        ? { ...clip, transition: Math.max(0, Math.round(value * 1000) / 1000) }
+        : clip,
+    );
     patchClips(set, get, clips, clipId, false);
   },
 
