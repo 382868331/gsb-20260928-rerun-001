@@ -63,3 +63,44 @@ def test_missing_media_is_reported_not_crashing(client):
     timeline = compute_timeline(project, {})
     assert timeline.clips[0].media_missing is True
     assert timeline.missing_media_ids == ["gone.mp4"]
+
+
+def test_transitions_overlap_and_clamp(client):
+    _, samples, _ = client
+    media_ids = list(samples)
+
+    from app.models import Clip, Project
+    from app.store import save_project
+    from app.timeline import compute_timeline
+    from app.media import load_index
+    import uuid
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    project = Project(
+        id=uuid.uuid4().hex,
+        name="t",
+        clips=[
+            Clip(id="a", media_id=media_ids[0], source_in=0.0, source_out=2.0),
+            Clip(id="b", media_id=media_ids[1], source_in=0.0, source_out=2.0,
+                 transition=0.5),
+            Clip(id="c", media_id=media_ids[2], source_in=0.0, source_out=2.0,
+                 transition=99.0),  # clamped to half of the shorter side
+        ],
+        version=1,
+        created_at=now,
+        updated_at=now,
+    )
+    save_project(project)
+    timeline = compute_timeline(project, load_index())
+    clips = timeline.clips
+    assert [c.transition for c in clips] == [0.0, 0.5, 1.0]
+    assert [c.start for c in clips] == [0.0, 2.0, 3.5]
+    assert [c.transition_start for c in clips] == [0.0, 1.5, 2.5]
+    # Total = sum(durations) - sum(transitions).
+    assert timeline.duration == 4.5
+    # First clip can never carry a transition.
+    project.clips[0].transition = 1.0
+    save_project(project)
+    timeline = compute_timeline(project, load_index())
+    assert timeline.clips[0].transition == 0.0

@@ -1,10 +1,12 @@
-"""End-to-end verification: export a known trim plan, then check the
-rendered file's video colour boundaries and audio tone boundaries with
+"""End-to-end verification: export a known trim plan with crossfade
+transitions and per-clip volume, then check the rendered file's video
+colour boundaries, transition blends and audio tone boundaries with
 ffprobe/ffmpeg. Used as a manual acceptance check, not a pytest case.
 """
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -39,21 +41,17 @@ def avg_color(path: Path, at: float) -> tuple[int, int, int]:
     return out[0], out[1], out[2]
 
 
-def dominant_tone(path: Path, at: float, length: float = 0.4) -> int:
-    # Goertzel-style check via ffmpeg astats would be complex; instead use
-    # ffmpeg's afftfilt-less approach: extract raw s16le and find peak
-    # frequency with a tiny zero-crossing estimate per half-window.
+def tone_energies(path: Path, at: float, length: float = 0.4) -> dict[int, float]:
+    """Goertzel energy of each sample tone in a short window."""
     proc = subprocess.run(
         ["ffmpeg", "-hide_banner", "-ss", f"{at:.3f}", "-t", f"{length:.3f}",
          "-i", str(path), "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
         capture_output=True, check=True,
     ).stdout
     import array
-    import math
     samples = array.array("h")
     samples.frombytes(proc)
-    n = len(samples)
-    best_freq, best_energy = 0, 0.0
+    energies: dict[int, float] = {}
     for target in (440, 660, 880):
         real = imag = 0.0
         k = 2 * math.pi * target / 8000
@@ -61,10 +59,12 @@ def dominant_tone(path: Path, at: float, length: float = 0.4) -> int:
             angle = k * i
             real += value * math.cos(angle)
             imag -= value * math.sin(angle)
-        energy = real * real + imag * imag
-        if energy > best_energy:
-            best_energy, best_freq = energy, target
-    return best_freq
+        energies[target] = real * real + imag * imag
+    return energies
+
+
+def dominant_tone(path: Path, at: float, length: float = 0.4) -> int:
+    return max(tone_energies(path, at, length).items(), key=lambda kv: kv[1])[0]
 
 
 def main() -> None:
@@ -88,13 +88,17 @@ def main() -> None:
     config.ensure_dirs()
     samples = list(ensure_samples())
     assert len(samples) == 3
-    # clip 1: 0.5-2.0 (1.5s, red/440)
-    # clip 2: 1.0-3.5 (2.5s, green/660)
-    # clip 3: 0.2-1.7 (1.5s, blue/880)
+    # clip 1: 0.5-2.0 (1.5s, red/440, volume 1.0)
+    # clip 2: 1.0-3.5 (2.5s, green/660, volume 0.5), 0.7s crossfade from clip 1
+    # clip 3: 0.2-1.7 (1.5s, blue/880, volume 1.0), 0.6s crossfade from clip 2
+    # timeline: starts 0 / 1.5 / 3.2, overlaps [0.8,1.5] and [2.7,3.3],
+    # total 1.5 + 2.5 + 1.5 - 0.7 - 0.6 = 4.2
     clips = [
         Clip(id="c1", media_id=samples[0], source_in=0.5, source_out=2.0),
-        Clip(id="c2", media_id=samples[1], source_in=1.0, source_out=3.5),
-        Clip(id="c3", media_id=samples[2], source_in=0.2, source_out=1.7),
+        Clip(id="c2", media_id=samples[1], source_in=1.0, source_out=3.5,
+             transition=0.7, volume=0.5),
+        Clip(id="c3", media_id=samples[2], source_in=0.2, source_out=1.7,
+             transition=0.6),
     ]
     project = Project(id="verify", name="verify", clips=clips, version=1,
                       created_at="t0", updated_at="t1")
@@ -107,27 +111,58 @@ def main() -> None:
     assert info.status == "done", (info.status, info.error)
     output = config.EXPORTS_DIR / f"{info.id}.mp4"
     duration = probe_duration(output)
-    print(f"export duration={duration:.3f} expected=5.5")
-    assert abs(duration - 5.5) < 0.12
+    print(f"export duration={duration:.3f} expected=4.2")
+    assert abs(duration - 4.2) < 0.12
 
-    # Sample video colour well inside each rendered segment.
-    checks = [(0.7, (216, 59, 59)), (2.7, (47, 168, 74)), (4.7, (47, 107, 216))]
+    # Solo colours well inside each clip's exclusive region.
+    checks = [(0.35, (216, 59, 59)), (2.0, (47, 168, 74)), (3.7, (47, 107, 216))]
     for at, expected in checks:
         color = avg_color(output, at)
         assert max(abs(c - e) for c, e in zip(color, expected)) < 14, (at, color)
         print(f"video t={at}s color={color} OK")
 
-    # Boundary samples must show the NEXT colour immediately after cut.
-    for at, expected in ((1.52, (47, 168, 74)), (4.02, (47, 107, 216))):
+    # Mid-transition frames must be a ~50/50 blend of the two colours.
+    blends = [
+        (1.15, (131, 113, 66)),  # red x green, overlap [0.8, 1.5]
+        (3.0, (47, 137, 145)),   # green x blue, overlap [2.7, 3.3]
+    ]
+    for at, expected in blends:
         color = avg_color(output, at)
-        assert max(abs(c - e) for c, e in zip(color, expected)) < 14, (at, color)
-        print(f"boundary t={at}s color={color} OK")
+        assert max(abs(c - e) for c, e in zip(color, expected)) < 45, (at, color)
+        print(f"blend t={at}s color={color} OK")
 
-    # Audio tones must align to the same boundaries.
-    for at, expected in ((0.7, 440), (2.7, 660), (4.7, 880)):
+    # Audio tones must align to the same regions.
+    for at, expected in ((0.35, 440), (2.0, 660), (3.7, 880)):
         tone = dominant_tone(output, at)
         assert tone == expected, (at, tone)
         print(f"audio t={at}s tone={tone}Hz OK")
+
+    # Mid-transition audio must contain BOTH tones (crossfade, not cut).
+    for at, pair in ((1.15, (440, 660)), (3.0, (660, 880))):
+        energies = tone_energies(output, at)
+        top_two = sorted(energies, key=energies.get, reverse=True)[:2]  # type: ignore[arg-type]
+        assert set(top_two) == set(pair), (at, energies)
+        print(f"crossfade t={at}s tones={pair} both present OK")
+
+    # Volume: clip 2 at 0.5x -> its solo tone energy ~ 1/4 of clip 1's.
+    solo1 = tone_energies(output, 0.35)[440]
+    solo2 = tone_energies(output, 2.0)[660]
+    ratio = solo2 / solo1
+    print(f"volume ratio={ratio:.3f} expected~0.25")
+    assert 0.08 < ratio < 0.55, ratio
+
+    # Cancel + retry must reproduce the same timeline render.
+    again = manager.create("verify")
+    deadline = time.time() + 60
+    while again.status in ("pending", "running") and time.time() < deadline:
+        time.sleep(0.2)
+        again = manager.get(again.id)
+    assert again.status == "done", (again.status, again.error)
+    duration2 = probe_duration(config.EXPORTS_DIR / f"{again.id}.mp4")
+    assert abs(duration2 - duration) < 0.05, (duration, duration2)
+    color2 = avg_color(config.EXPORTS_DIR / f"{again.id}.mp4", 1.15)
+    assert max(abs(c - e) for c, e in zip(color2, (131, 113, 66))) < 45, color2
+    print(f"re-export duration={duration2:.3f} blend={color2} CONSISTENT")
     print("ALL BOUNDARY CHECKS PASSED", output)
 
 

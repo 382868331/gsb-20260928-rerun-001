@@ -114,6 +114,19 @@ input, select {
   padding: 4px 10px;
   border-radius: 999px;
   font-size: 12px;
+  z-index: 5;
+}
+.loop-badge {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  z-index: 5;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: rgba(23, 30, 44, 0.9);
+  color: var(--warn);
+  border: 1px solid var(--warn);
 }
 .preview-controls { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .scrubber { flex: 1; }
@@ -123,18 +136,21 @@ input, select {
 
 .timeline-head { display: flex; justify-content: space-between; align-items: center; }
 .track {
-  display: flex;
-  gap: 4px;
+  position: relative;
+  display: block;
   min-height: 86px;
   background: #0c111b;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 6px;
   margin-top: 10px;
+  overflow: hidden;
 }
-.empty-track { color: var(--muted); margin: auto; }
+.empty-track { color: var(--muted); padding: 28px 0; text-align: center; }
 .track-clip {
-  position: relative;
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
   min-width: 28px;
   border-radius: 8px;
   padding: 8px;
@@ -148,6 +164,15 @@ input, select {
 }
 .track-clip.selected { outline: 2px solid var(--accent); }
 .track-clip.missing { background: linear-gradient(160deg, #6e4a22, #4f3619); border-color: var(--warn); }
+.transition-wedge {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, rgba(224, 165, 61, 0.55), rgba(224, 165, 61, 0.08));
+  border-right: 1px dashed var(--warn);
+  pointer-events: none;
+}
 .clip-name { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .clip-range { font-size: 11px; color: #c4d5f2; font-variant-numeric: tabular-nums; }
 .clip-waves { display: flex; gap: 3px; align-items: flex-end; height: 14px; margin-top: auto; }

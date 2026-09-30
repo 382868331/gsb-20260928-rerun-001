@@ -6,28 +6,44 @@ function makeClipId(): string {
   return `clip-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Same math as backend compute_timeline: running sum of clip durations. */
+/** Same math as backend compute_timeline: running sum of clip durations
+ * minus the crossfade overlaps. A clip fades in during the
+ * ``transition`` seconds before its nominal start. */
 export function computeLocalTimeline(
   clips: Clip[],
   media: Record<string, MediaInfo>,
 ): Timeline {
   let cursor = 0;
   const missing = new Set<string>();
-  const result = clips.map((clip) => {
+  const result = clips.map((clip, index) => {
     const item = media[clip.media_id];
     if (!item) missing.add(clip.media_id);
-    const start = Math.round(cursor * 1e6) / 1e6;
     const duration = Math.max(0, clip.source_out - clip.source_in);
+    let transition = index === 0 ? 0 : Math.max(0, clip.transition ?? 0);
+    transition = Math.min(transition, duration * 0.5);
+    if (index > 0) {
+      const prev = clips[index - 1];
+      const prevDuration = Math.max(0, prev.source_out - prev.source_in);
+      transition = Math.min(transition, prevDuration * 0.5);
+    }
+    transition = Math.round(transition * 1e6) / 1e6;
+    const start = Math.round(cursor * 1e6) / 1e6;
     const end = Math.round((cursor + duration) * 1e6) / 1e6;
-    cursor = end;
+    cursor =
+      index === 0
+        ? end
+        : Math.round((cursor + duration - transition) * 1e6) / 1e6;
     return {
       clip_id: clip.id,
       media_id: clip.media_id,
       start,
       end,
+      transition_start: Math.round((start - transition) * 1e6) / 1e6,
+      transition,
       duration: Math.round(duration * 1e6) / 1e6,
       source_in: clip.source_in,
       source_out: clip.source_out,
+      volume: Math.max(0, Math.min(4, clip.volume ?? 1)),
       media_missing: !item,
       source_duration: item?.duration ?? null,
     };
@@ -60,6 +76,10 @@ interface EditorState {
   removeClip: (clipId: string) => void;
   moveClip: (clipId: string, direction: -1 | 1) => void;
   trimClip: (clipId: string, edge: "in" | "out", value: number) => void;
+  setVolume: (clipId: string, value: number) => void;
+  setTransition: (clipId: string, value: number) => void;
+  loopClipId: string | null;
+  setLoopClip: (clipId: string | null) => void;
   renameProject: (name: string) => void;
   selectClip: (clipId: string | null) => void;
   startExport: () => Promise<void>;
@@ -76,6 +96,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   project: null,
   timeline: null,
   selectedClipId: null,
+  loopClipId: null,
   exportJob: null,
   message: null,
   busy: false,
@@ -165,6 +186,8 @@ export const useEditor = create<EditorState>((set, get) => ({
       media_id: mediaId,
       source_in: 0,
       source_out: Math.min(item.duration, Math.max(1, item.duration)),
+      volume: 1,
+      transition: 0,
     };
     const clips = [...project.clips, clip];
     patchClips(set, get, clips, clip.id, true);
@@ -207,10 +230,38 @@ export const useEditor = create<EditorState>((set, get) => ({
           maxDuration,
         );
       }
+      // Keep the overlap within half of the trimmed duration (the
+      // backend clamps the same way when the timeline is computed).
+      const newDuration = next.source_out - next.source_in;
+      next.transition = Math.min(next.transition, Math.max(0, newDuration * 0.5));
       return next;
     });
     patchClips(set, get, clips, clipId, false);
   },
+
+  setVolume: (clipId, value) => {
+    const { project } = get();
+    if (!project) return;
+    const clips = project.clips.map((clip) =>
+      clip.id === clipId
+        ? { ...clip, volume: Math.max(0, Math.min(4, Math.round(value * 100) / 100)) }
+        : clip,
+    );
+    patchClips(set, get, clips, clipId, true);
+  },
+
+  setTransition: (clipId, value) => {
+    const { project } = get();
+    if (!project) return;
+    const clips = project.clips.map((clip) =>
+      clip.id === clipId
+        ? { ...clip, transition: Math.max(0, Math.round(value * 1000) / 1000) }
+        : clip,
+    );
+    patchClips(set, get, clips, clipId, true);
+  },
+
+  setLoopClip: (clipId) => set({ loopClipId: clipId }),
 
   renameProject: (name) => {
     const { project } = get();

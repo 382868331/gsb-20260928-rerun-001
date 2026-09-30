@@ -180,3 +180,66 @@ def test_upload_is_deduplicated_and_original_untouched(client, tmp_path):
     media_list = test_client.get("/api/media").json()
     # Same content -> same media id, no duplicate entry.
     assert sum(item["id"] == media_id for item in media_list) == 1
+
+
+def test_transition_export_matches_timeline_and_retry_is_consistent(client):
+    test_client, samples, config = client
+    media_ids = list(samples)
+    payload = {
+        "name": "转场工程",
+        "clips": [
+            {"id": "c1", "media_id": media_ids[0], "source_in": 0.5,
+             "source_out": 2.0},
+            {"id": "c2", "media_id": media_ids[1], "source_in": 1.0,
+             "source_out": 3.5, "transition": 0.7, "volume": 0.5},
+            {"id": "c3", "media_id": media_ids[2], "source_in": 0.2,
+             "source_out": 1.7, "transition": 0.6},
+        ],
+    }
+    project = test_client.post("/api/projects", json=payload).json()
+    project_id = project["id"]
+
+    timeline = test_client.get(f"/api/projects/{project_id}/timeline").json()
+    assert abs(timeline["duration"] - 4.2) < 0.01
+    assert [round(c["transition"], 3) for c in timeline["clips"]] == [0, 0.7, 0.6]
+    assert [round(c["transition_start"], 3) for c in timeline["clips"]] == [
+        0.0, 0.8, 2.7,
+    ]
+
+    durations = []
+    for _ in range(2):
+        job = _wait_job(test_client, project_id)
+        assert job["status"] == "done", job
+        output = config.EXPORTS_DIR / f"{job['id']}.mp4"
+        probe = json.loads(
+            __import__("subprocess").run(
+                ["ffprobe", "-v", "error", "-show_format", "-of", "json",
+                 str(output)],
+                capture_output=True, text=True, check=True,
+            ).stdout
+        )
+        durations.append(float(probe["format"]["duration"]))
+    # Exported length reflects the overlaps, and a retry renders the same.
+    assert abs(durations[0] - 4.2) < 0.12
+    assert abs(durations[0] - durations[1]) < 0.05
+
+
+def test_cancelled_export_leaves_no_output_and_project_intact(client):
+    test_client, samples, config = client
+    project = _create_project_with_clips(test_client, samples)
+    project_id = project["id"]
+    created = test_client.post(f"/api/projects/{project_id}/exports").json()
+    test_client.post(f"/api/exports/{created['id']}/cancel")
+    deadline = time.time() + 30
+    job = created
+    while job["status"] in ("pending", "running") and time.time() < deadline:
+        time.sleep(0.1)
+        job = test_client.get(f"/api/exports/{created['id']}").json()
+    assert job["status"] in ("cancelled", "done")
+    if job["status"] == "cancelled":
+        assert not (config.EXPORTS_DIR / f"{created['id']}.mp4").exists()
+    # Project still opens and a fresh export succeeds afterwards.
+    timeline = test_client.get(f"/api/projects/{project_id}/timeline").json()
+    assert timeline["clips"]
+    retry = _wait_job(test_client, project_id)
+    assert retry["status"] == "done", retry

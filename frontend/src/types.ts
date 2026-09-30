@@ -13,6 +13,8 @@ export interface Clip {
   media_id: string;
   source_in: number;
   source_out: number;
+  volume: number;
+  transition: number;
 }
 
 export interface Project {
@@ -29,9 +31,12 @@ export interface TimelineClip {
   media_id: string;
   start: number;
   end: number;
+  transition_start: number;
+  transition: number;
   duration: number;
   source_in: number;
   source_out: number;
+  volume: number;
   media_missing: boolean;
   source_duration: number | null;
 }

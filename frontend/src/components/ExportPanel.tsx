@@ -25,7 +25,7 @@ export function ExportPanel() {
     <section className="panel export-panel">
       <h2>导出成片</h2>
       <p className="meta">
-        导出与预览使用同一条时间线计算结果（顺序 + 入出点），画面和声音逐段一起裁切后再拼接。
+        导出与预览使用同一条时间线计算结果（顺序 + 入出点 + 音量 + 交叠转场），画面与声音在转场处交叉淡化，所见即所导。
       </p>
       {missingCount > 0 && (
         <p className="warning">
