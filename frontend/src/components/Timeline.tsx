@@ -1,6 +1,6 @@
 import { ArrowLeft, ArrowRight, Trash2 } from "lucide-react";
 import { useEditor } from "../store";
-import type { Clip, MediaInfo } from "../types";
+import type { Clip, MediaInfo, Timeline, TimelineClip } from "../types";
 
 function formatDuration(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
@@ -17,6 +17,8 @@ export function Timeline() {
   const removeClip = useEditor((state) => state.removeClip);
   const moveClip = useEditor((state) => state.moveClip);
   const trimClip = useEditor((state) => state.trimClip);
+  const setTransition = useEditor((state) => state.setTransition);
+  const setVolume = useEditor((state) => state.setVolume);
 
   if (!project || !timeline) return null;
   const index = new Map<string, MediaInfo>(media.map((item) => [item.id, item]));
@@ -31,7 +33,7 @@ export function Timeline() {
         <span className="meta">总时长 {formatDuration(timeline.duration)}</span>
       </div>
 
-      <div className="track" aria-label="统一音视频时间线">
+      <div className="track" aria-label="统一音视频时间线（含交叠转场）">
         {timeline.clips.length === 0 && (
           <div className="empty-track">从左侧素材库把视频加到这里</div>
         )}
@@ -50,8 +52,19 @@ export function Timeline() {
               onClick={() => selectClip(clip.clip_id)}
               title={`${item?.filename ?? clip.media_id}  位置 ${formatDuration(
                 clip.start,
-              )} - ${formatDuration(clip.end)}`}
+              )} - ${formatDuration(clip.end)}${
+                clip.transition_in > 0
+                  ? ` 交叠 ${formatDuration(clip.transition_in)}`
+                  : ""
+              } 音量 ${Math.round(clip.volume * 100)}%`}
             >
+              {clip.transition_in > 0 && (
+                <span
+                  className="clip-overlap"
+                  style={{ width: `${(clip.transition_in / clip.duration) * 100}%` }}
+                  aria-hidden="true"
+                />
+              )}
               <span className="clip-name">
                 {clipIndex + 1}. {item?.filename ?? "素材缺失"}
               </span>
@@ -61,6 +74,13 @@ export function Timeline() {
               <div className="clip-waves" aria-hidden="true">
                 <i /><i /><i /><i /><i />
               </div>
+              {clipIndex > 0 && (
+                <TransitionHandle
+                  clip={clip}
+                  prevClip={timeline.clips[clipIndex - 1]}
+                  onSet={(value) => setTransition(clip.clip_id, value)}
+                />
+              )}
             </div>
           );
         })}
@@ -70,10 +90,13 @@ export function Timeline() {
         clip={selected}
         media={selectedMedia}
         onTrim={trimClip}
+        onTransition={setTransition}
+        onVolume={setVolume}
         onMove={moveClip}
         onRemove={removeClip}
         position={selected ? timeline.clips.findIndex((c) => c.clip_id === selected.id) : -1}
         total={project.clips.length}
+        timeline={timeline}
       />
     </section>
   );
@@ -85,11 +108,24 @@ interface InspectorProps {
   position: number;
   total: number;
   onTrim: (clipId: string, edge: "in" | "out", value: number) => void;
+  onTransition: (clipId: string, value: number) => void;
+  onVolume: (clipId: string, value: number) => void;
   onMove: (clipId: string, direction: -1 | 1) => void;
   onRemove: (clipId: string) => void;
 }
 
-function ClipInspector({ clip, media, position, total, onTrim, onMove, onRemove }: InspectorProps) {
+function ClipInspector({
+  clip,
+  media,
+  position,
+  total,
+  timeline,
+  onTrim,
+  onTransition,
+  onVolume,
+  onMove,
+  onRemove,
+}: InspectorProps & { timeline: Timeline }) {
   if (!clip) {
     return <p className="hint">选择一个片段后可以裁切入点/出点或调整顺序。</p>;
   }
@@ -145,6 +181,73 @@ function ClipInspector({ clip, media, position, total, onTrim, onMove, onRemove 
         片段时长 {formatDuration(Math.max(0, clip.source_out - clip.source_in))}
         ，修改后后续片段位置自动级联变化。
       </span>
+      {position > 0 && (
+        <label className="trim-row">
+          <span>与上一段交叠转场</span>
+          <input
+            type="range"
+            min={0}
+            step={0.05}
+            max={transitionMax(clip, timeline.clips[position - 1])}
+            value={clip.transition_in ?? 0}
+            onChange={(event) => onTransition(clip.id, Number(event.target.value))}
+          />
+          <strong>{formatDuration(clip.transition_in ?? 0)}</strong>
+        </label>
+      )}
+      <label className="trim-row">
+        <span>独立音量（Volume2 图标）</span>
+        <input
+          type="range"
+          min={0}
+          max={2}
+          step={0.05}
+          value={clip.volume ?? 1}
+          onChange={(event) => onVolume(clip.id, Number(event.target.value))}
+        />
+        <strong>{Math.round((clip.volume ?? 1) * 100)}%</strong>
+      </label>
     </div>
+  );
+}
+
+function transitionMax(clip: Clip, prev: TimelineClip | undefined): number {
+  if (!prev) return 0;
+  const own = Math.max(0, clip.source_out - clip.source_in - 1 / 60);
+  const theirs = Math.max(0, prev.duration - prev.transition_in - 1 / 60);
+  return Math.min(own, theirs);
+}
+
+function TransitionHandle({
+  clip,
+  prevClip,
+  onSet,
+}: {
+  clip: TimelineClip;
+  prevClip: TimelineClip;
+  onSet: (value: number) => void;
+}) {
+  const max = transitionMax(
+    {
+      id: clip.clip_id,
+      media_id: clip.media_id,
+      source_in: clip.source_in,
+      source_out: clip.source_out,
+    },
+    prevClip,
+  );
+  return (
+    <input
+      className="transition-handle"
+      type="range"
+      min={0}
+      max={max}
+      step={0.05}
+      value={clip.transition_in}
+      title="拖动调整与上一段的交叠转场长度"
+      aria-label="交叠转场长度"
+      onClick={(event) => event.stopPropagation()}
+      onChange={(event) => onSet(Number(event.target.value))}
+    />
   );
 }

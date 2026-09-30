@@ -13,7 +13,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from . import media as media_service
-from .config import MEDIA_DIR, ensure_dirs
+from . import config
+from .config import ensure_dirs
 from .exporter import manager as export_manager
 from .models import Project, ProjectPayload
 from .samples import ensure_samples
@@ -56,7 +57,11 @@ def upload_media(file: UploadFile = File(...)) -> dict:
     suffix = Path(file.filename or "clip.mp4").suffix.lower()
     if not re.fullmatch(r"\.[a-z0-9]{2,5}", suffix):
         suffix = ".mp4"
-    staging = MEDIA_DIR.parent / f"upload_{uuid.uuid4().hex}{suffix}"
+    # Uploads always land in a dedicated staging directory that is created
+    # on demand; first use (no data root yet) and a wiped temp area must
+    # both work without any other operation running first.
+    ensure_dirs()
+    staging = config.STAGING_DIR / f"upload_{uuid.uuid4().hex}{suffix}"
     try:
         content = file.file.read()
         staging.write_bytes(content)

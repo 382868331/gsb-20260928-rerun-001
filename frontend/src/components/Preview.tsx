@@ -11,22 +11,39 @@ function formatTime(seconds: number): string {
   return `${minutes}:${secs}`;
 }
 
-function clipAt(timeline: Timeline, time: number): TimelineClip | null {
-  return (
-    timeline.clips.find((clip) => time >= clip.start && time < clip.end) ??
-    timeline.clips[timeline.clips.length - 1] ??
-    null
-  );
+/** Clips active at a timeline time, ordered so the newest is on top. */
+function activeClipsAt(timeline: Timeline, time: number): TimelineClip[] {
+  return timeline.clips.filter((clip) => time >= clip.start - 0.001 && time < clip.end - 0.001);
+}
+
+/** Visual/audible weight of a clip at a timeline time (matches the
+ * exporter's linear xfade / triangular acrossfade ramps). */
+function clipWeight(clip: TimelineClip, time: number): number {
+  if (clip.transition_in <= 0) return 1;
+  const fadeStart = clip.start;
+  if (time < fadeStart) return 0;
+  if (time < fadeStart + clip.transition_in) {
+    return Math.min(1, (time - fadeStart) / clip.transition_in);
+  }
+  return 1;
+}
+
+interface Layer {
+  clip: TimelineClip;
+  el: HTMLVideoElement;
+  gain: GainNode;
 }
 
 export function Preview() {
   const timeline = useEditor((state) => state.timeline);
   const media = useEditor((state) => state.media);
   const project = useEditor((state) => state.project);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const layerHostRef = useRef<HTMLDivElement | null>(null);
   const timeRef = useRef(0);
   const rafRef = useRef<number | null>(null);
-  const activeClipRef = useRef<string | null>(null);
+  const layersRef = useRef<Map<string, Layer>>(new Map());
+  const audioRef = useRef<AudioContext | null>(null);
+  const masterRef = useRef<GainNode | null>(null);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const playingRef = useRef(false);
@@ -35,9 +52,8 @@ export function Preview() {
   const duration = timeline?.duration ?? 0;
 
   useEffect(() => {
-    // Reset preview when the project structure changes materially.
     timeRef.current = 0;
-    activeClipRef.current = null;
+    removeAllLayers();
     setPosition(0);
     setPlaying(false);
     playingRef.current = false;
@@ -46,50 +62,109 @@ export function Preview() {
   useEffect(() => {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      void audioRef.current?.close().catch(() => undefined);
     };
   }, []);
 
-  const seekClipTo = (clip: TimelineClip, localOffset: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    const sourceTime = clip.source_in + localOffset;
-    if (Math.abs(video.currentTime - sourceTime) > 0.08) {
-      video.currentTime = sourceTime;
+  const ensureAudio = () => {
+    if (!audioRef.current) {
+      const ctx = new AudioContext();
+      const master = ctx.createGain();
+      master.gain.value = 1;
+      master.connect(ctx.destination);
+      audioRef.current = ctx;
+      masterRef.current = master;
     }
+    if (audioRef.current.state === "suspended") void audioRef.current.resume();
+    return audioRef.current;
+  };
+
+  const removeLayer = (clipId: string) => {
+    const layer = layersRef.current.get(clipId);
+    if (!layer) return;
+    layersRef.current.delete(clipId);
+    try {
+      layer.gain.disconnect();
+    } catch {
+      // already disconnected
+    }
+    layer.el.remove();
+  };
+
+  const removeAllLayers = () => {
+    for (const id of [...layersRef.current.keys()]) removeLayer(id);
+  };
+
+  const ensureLayer = (clip: TimelineClip): Layer | null => {
+    const existing = layersRef.current.get(clip.clip_id);
+    if (existing) return existing;
+    const item = mediaIndex.get(clip.media_id);
+    if (!item || clip.media_missing) return null;
+    const ctx = ensureAudio();
+    const el = document.createElement("video");
+    el.src = api.mediaStreamUrl(clip.media_id);
+    el.crossOrigin = "anonymous";
+    el.playsInline = true;
+    el.preload = "auto";
+    el.muted = false;
+    el.className = "layer-video";
+    const source = ctx.createMediaElementSource(el);
+    const gain = ctx.createGain();
+    source.connect(gain);
+    gain.connect(masterRef.current!);
+    layerHostRef.current?.appendChild(el);
+    const layer: Layer = { clip, el, gain };
+    layersRef.current.set(clip.clip_id, layer);
+    return layer;
+  };
+
+  const renderFrame = (time: number) => {
+    if (!timeline) return;
+    const active = activeClipsAt(timeline, time);
+    const activeIds = new Set(active.map((clip) => clip.clip_id));
+    for (const id of [...layersRef.current.keys()]) {
+      if (!activeIds.has(id)) removeLayer(id);
+    }
+    active.forEach((clip) => {
+      const layer = ensureLayer(clip);
+      if (!layer) return;
+      const sourceTime = clip.source_in + Math.max(0, time - clip.start);
+      if (Math.abs(layer.el.currentTime - sourceTime) > 0.08) {
+        try {
+          layer.el.currentTime = sourceTime;
+        } catch {
+          // seek may reject before metadata loads
+        }
+      }
+      const weight = clipWeight(clip, time);
+      // During an overlap the outgoing clip's weight is 1 - incoming
+      // weight, exactly like a linear xfade.
+      const next = timeline.clips.find(
+        (candidate) =>
+          candidate.transition_in > 0 &&
+          time >= candidate.start &&
+          time < candidate.start + candidate.transition_in,
+      );
+      const ownWeight = next && clip.clip_id !== next.clip_id ? 1 - clipWeight(next, time) : weight;
+      layer.el.style.opacity = String(ownWeight);
+      layer.gain.gain.value = clip.volume * ownWeight;
+      if (playingRef.current && layer.el.paused) {
+        void layer.el.play().catch(() => undefined);
+      } else if (!playingRef.current && !layer.el.paused) {
+        layer.el.pause();
+      }
+    });
   };
 
   const tick = () => {
-    const video = videoRef.current;
-    if (!timeline || !video) {
-      rafRef.current = requestAnimationFrame(tick);
-      return;
-    }
-    const clip = clipAt(timeline, timeRef.current);
-    if (!clip) {
-      stop();
-      return;
-    }
+    if (!timeline) return;
     if (timeRef.current >= timeline.duration - 0.005) {
       stop();
       setPosition(timeline.duration);
+      renderFrame(timeline.duration - 0.01);
       return;
     }
-    const localOffset = Math.max(0, timeRef.current - clip.start);
-    if (activeClipRef.current !== clip.clip_id) {
-      activeClipRef.current = clip.clip_id;
-      const url = api.mediaStreamUrl(clip.media_id);
-      const item = mediaIndex.get(clip.media_id);
-      if (!item) {
-        // Missing media: advance clock silently (kept editable in timeline).
-      } else if (!video.src.endsWith(url)) {
-        video.src = url;
-      }
-      video.load();
-      video.currentTime = clip.source_in + localOffset;
-      if (playingRef.current) void video.play().catch(() => undefined);
-    } else if (!clip.media_missing) {
-      seekClipTo(clip, localOffset);
-    }
+    renderFrame(timeRef.current);
     timeRef.current += 1 / 60;
     setPosition(timeRef.current);
     rafRef.current = requestAnimationFrame(tick);
@@ -97,10 +172,8 @@ export function Preview() {
 
   const start = () => {
     if (!timeline || timeline.duration === 0) return;
-    if (timeRef.current >= timeline.duration - 0.02) {
-      timeRef.current = 0;
-      activeClipRef.current = null;
-    }
+    if (timeRef.current >= timeline.duration - 0.02) timeRef.current = 0;
+    ensureAudio();
     playingRef.current = true;
     setPlaying(true);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -110,51 +183,39 @@ export function Preview() {
   const pause = () => {
     playingRef.current = false;
     setPlaying(false);
-    videoRef.current?.pause();
+    layersRef.current.forEach((layer) => layer.el.pause());
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   };
 
   const stop = () => {
     playingRef.current = false;
     setPlaying(false);
-    videoRef.current?.pause();
+    layersRef.current.forEach((layer) => layer.el.pause());
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   };
 
   const restart = () => {
     stop();
     timeRef.current = 0;
-    activeClipRef.current = null;
+    removeAllLayers();
     setPosition(0);
+    requestAnimationFrame(() => renderFrame(0));
   };
 
   const scrub = (value: number) => {
     stop();
     timeRef.current = value;
-    activeClipRef.current = null; // force reload at new source offset
     setPosition(value);
-    // Render one frame synchronously.
-    rafRef.current = requestAnimationFrame(function once() {
-      const video = videoRef.current;
-      if (video && timeline) {
-        const clip = clipAt(timeline, value);
-        if (clip && !clip.media_missing) {
-          const url = api.mediaStreamUrl(clip.media_id);
-          if (!video.src.endsWith(url)) video.src = url;
-          video.currentTime = clip.source_in + (value - clip.start);
-        }
-      }
-    });
+    requestAnimationFrame(() => renderFrame(value));
   };
 
-  const currentClip = timeline ? clipAt(timeline, position) : null;
+  const currentClips = timeline ? activeClipsAt(timeline, position) : [];
   const missing = timeline?.missing_media_ids.length ?? 0;
 
   return (
     <section className="panel preview">
-      <div className="preview-stage">
-        <video ref={videoRef} muted playsInline preload="auto" />
-        {currentClip?.media_missing && (
+      <div className="preview-stage" ref={layerHostRef}>
+        {currentClips.some((clip) => clip.media_missing) && (
           <div className="missing-badge">素材缺失，占位预览</div>
         )}
       </div>

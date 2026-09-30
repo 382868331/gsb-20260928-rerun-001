@@ -1,36 +1,60 @@
 import { create } from "zustand";
 import { api } from "./api";
-import type { Clip, ExportInfo, MediaInfo, Project, Timeline } from "./types";
+import type {
+  Clip,
+  ExportInfo,
+  MediaInfo,
+  Project,
+  Timeline,
+  TimelineClip,
+} from "./types";
 
 function makeClipId(): string {
   return `clip-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /** Same math as backend compute_timeline: running sum of clip durations. */
+const FRAME = 1 / 30;
+
 export function computeLocalTimeline(
   clips: Clip[],
   media: Record<string, MediaInfo>,
 ): Timeline {
   let cursor = 0;
   const missing = new Set<string>();
-  const result = clips.map((clip) => {
+  const result: TimelineClip[] = [];
+  clips.forEach((clip, index) => {
     const item = media[clip.media_id];
     if (!item) missing.add(clip.media_id);
-    const start = Math.round(cursor * 1e6) / 1e6;
     const duration = Math.max(0, clip.source_out - clip.source_in);
-    const end = Math.round((cursor + duration) * 1e6) / 1e6;
+    const requestedRaw = Math.max(0, clip.transition_in ?? 0);
+    const requested = requestedRaw < FRAME / 2 ? 0 : requestedRaw;
+    let transition = 0;
+    if (index > 0) {
+      const prev = result[index - 1];
+      const room = Math.min(
+        Math.max(0, duration - FRAME / 2),
+        Math.max(0, prev.duration - prev.transition_in - FRAME / 2),
+      );
+      transition = Math.round(Math.min(requested, room) * 1e6) / 1e6;
+    }
+    const start = Math.round((cursor - transition) * 1e6) / 1e6;
+    const end = Math.round((start + duration) * 1e6) / 1e6;
     cursor = end;
-    return {
+    const volume = Math.min(4, Math.max(0, clip.volume ?? 1));
+    result.push({
       clip_id: clip.id,
       media_id: clip.media_id,
       start,
       end,
       duration: Math.round(duration * 1e6) / 1e6,
+      transition_in: transition,
+      volume: Math.round(volume * 1e6) / 1e6,
       source_in: clip.source_in,
       source_out: clip.source_out,
       media_missing: !item,
       source_duration: item?.duration ?? null,
-    };
+    });
   });
   return {
     duration: Math.round(cursor * 1e6) / 1e6,
@@ -60,6 +84,8 @@ interface EditorState {
   removeClip: (clipId: string) => void;
   moveClip: (clipId: string, direction: -1 | 1) => void;
   trimClip: (clipId: string, edge: "in" | "out", value: number) => void;
+  setTransition: (clipId: string, value: number) => void;
+  setVolume: (clipId: string, value: number) => void;
   renameProject: (name: string) => void;
   selectClip: (clipId: string | null) => void;
   startExport: () => Promise<void>;
@@ -165,6 +191,8 @@ export const useEditor = create<EditorState>((set, get) => ({
       media_id: mediaId,
       source_in: 0,
       source_out: Math.min(item.duration, Math.max(1, item.duration)),
+      transition_in: 0,
+      volume: 1,
     };
     const clips = [...project.clips, clip];
     patchClips(set, get, clips, clip.id, true);
@@ -220,6 +248,30 @@ export const useEditor = create<EditorState>((set, get) => ({
   },
 
   selectClip: (clipId) => set({ selectedClipId: clipId }),
+
+  setTransition: (clipId, value) => {
+    const { project } = get();
+    if (!project) return;
+    const clips = project.clips.map((clip) =>
+      clip.id === clipId
+        ? { ...clip, transition_in: Math.max(0, Math.round(value * 100) / 100) }
+        : clip,
+    );
+    patchClips(set, get, clips, clipId, false);
+    scheduleSave(set, get);
+  },
+
+  setVolume: (clipId, value) => {
+    const { project } = get();
+    if (!project) return;
+    const clips = project.clips.map((clip) =>
+      clip.id === clipId
+        ? { ...clip, volume: Math.min(4, Math.max(0, Math.round(value * 100) / 100)) }
+        : clip,
+    );
+    patchClips(set, get, clips, clipId, false);
+    scheduleSave(set, get);
+  },
 
   startExport: async () => {
     const { project } = get();

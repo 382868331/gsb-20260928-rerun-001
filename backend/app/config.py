@@ -17,8 +17,9 @@ MEDIA_DIR = DATA_ROOT / "media"
 PROJECTS_DIR = DATA_ROOT / "projects"
 EXPORTS_DIR = DATA_ROOT / "exports"
 SAMPLES_DIR = DATA_ROOT / "samples"
+STAGING_DIR = DATA_ROOT / "staging"
 
 
 def ensure_dirs() -> None:
-    for path in (MEDIA_DIR, PROJECTS_DIR, EXPORTS_DIR, SAMPLES_DIR):
+    for path in (MEDIA_DIR, PROJECTS_DIR, EXPORTS_DIR, SAMPLES_DIR, STAGING_DIR):
         path.mkdir(parents=True, exist_ok=True)

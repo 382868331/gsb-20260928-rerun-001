@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 
 
@@ -157,6 +158,12 @@ def test_cancelled_export_leaves_editable_project_and_no_output(client):
     output = config.EXPORTS_DIR / f"{job_id}.mp4"
     if final_status == "cancelled":
         assert not output.exists()
+        # No partial render may be left behind either.
+        leftovers = [
+            p.name for p in config.EXPORTS_DIR.iterdir()
+            if p.suffix == ".mp4" or p.name.endswith(".part.mp4")
+        ]
+        assert leftovers == [], leftovers
     reopened = test_client.get(f"/api/projects/{project_id}").json()
     assert len(reopened["clips"]) == 3
     # Another export attempt works right away.
@@ -180,3 +187,108 @@ def test_upload_is_deduplicated_and_original_untouched(client, tmp_path):
     media_list = test_client.get("/api/media").json()
     # Same content -> same media id, no duplicate entry.
     assert sum(item["id"] == media_id for item in media_list) == 1
+
+
+def test_upload_works_on_fresh_root_and_after_wiping_temp(client, tmp_path):
+    """First-ever upload (no dirs created yet) and an upload after the
+    staging area was wiped must both succeed without any prior op.
+    """
+    test_client, samples, config = client
+    # A tiny valid clip independent of any previously generated assets.
+    import subprocess
+
+    source = tmp_path / "fresh-source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=purple:s=64x36:r=30:d=0.5",
+            "-f", "lavfi", "-i", "sine=frequency=330:duration=0.5:sample_rate=48000",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-shortest", str(source),
+        ],
+        check=True,
+    )
+    payload = source.read_bytes()
+
+    # Simulate a brand-new installation: delete the whole data root, then
+    # upload as the very first operation (no GET /media, no samples).
+    data_root = config.DATA_ROOT
+    shutil.rmtree(data_root, ignore_errors=True)
+    response = test_client.post(
+        "/api/media",
+        files={"file": ("fresh.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 200, response
+    assert (data_root / "staging").is_dir()
+    # No staging leftovers.
+    leftovers = [p for p in (data_root / "staging").iterdir()]
+    assert leftovers == []
+
+    # Wipe the temp material dir and upload again immediately.
+    shutil.rmtree(data_root / "staging", ignore_errors=True)
+    response = test_client.post(
+        "/api/media",
+        files={"file": ("again.mp4", payload, "video/mp4")},
+    )
+    assert response.status_code == 200
+    assert (data_root / "staging").is_dir()
+
+
+def _transition_project(samples, transitions=(0.0, 0.5, 0.8), volumes=(1.0, 0.5, 1.5)):
+    return {
+        "name": "转场工程",
+        "clips": [
+            {
+                "id": f"clip-{index}",
+                "media_id": media_id,
+                "source_in": 0.0,
+                "source_out": 2.0,
+                "transition_in": tr,
+                "volume": vol,
+            }
+            for index, (media_id, tr, vol) in enumerate(
+                zip(samples, transitions, volumes)
+            )
+        ],
+    }
+
+
+def test_transitions_shorthen_timeline_and_persist(client):
+    test_client, samples, _ = client
+    # clip0 [0,2]; clip1 starts 0.5 earlier -> [1.5,3.5]; clip2 overlaps
+    # 0.8 -> [2.7,4.7].
+    project = test_client.post("/api/projects", json=_transition_project(samples)).json()
+    timeline = test_client.get(f"/api/projects/{project['id']}/timeline").json()
+    assert abs(timeline["duration"] - 4.7) < 0.001
+    assert [round(c["start"], 3) for c in timeline["clips"]] == [0.0, 1.5, 2.7]
+    assert [c["transition_in"] for c in timeline["clips"]] == [0.0, 0.5, 0.8]
+    assert [c["volume"] for c in timeline["clips"]] == [1.0, 0.5, 1.5]
+
+    # Reopen: transition and volume survive the saved JSON.
+    reopened = test_client.get(f"/api/projects/{project['id']}").json()
+    assert [c.get("transition_in") for c in reopened["clips"]] == [0.0, 0.5, 0.8]
+    assert [c.get("volume") for c in reopened["clips"]] == [1.0, 0.5, 1.5]
+
+
+def test_transitions_are_clamped_and_exports_with_overlap(client):
+    test_client, samples, config = client
+    payload = _transition_project(samples, transitions=(0.0, 9.0, 9.0))
+    project = test_client.post("/api/projects", json=payload).json()
+    timeline = test_client.get(f"/api/projects/{project['id']}/timeline").json()
+    # Each 2s clip can lose at most half a frame to the overlap and two
+    # neighbouring overlaps cannot touch.
+    assert all(0 <= c["transition_in"] < 2.0 for c in timeline["clips"])
+    assert all(c["start"] >= 0 for c in timeline["clips"])
+
+    sane = _transition_project(samples)
+    project = test_client.post("/api/projects", json=sane).json()
+    job = _wait_job(test_client, project["id"])
+    assert job["status"] == "done", job
+    output = config.EXPORTS_DIR / f"{job['id']}.mp4"
+    probe = json.loads(
+        __import__("subprocess").run(
+            ["ffprobe", "-v", "error", "-show_format", "-of", "json", str(output)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    )
+    assert abs(float(probe["format"]["duration"]) - 4.7) < 0.12

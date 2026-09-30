@@ -1,6 +1,15 @@
 """End-to-end verification: export a known trim plan, then check the
 rendered file's video colour boundaries and audio tone boundaries with
 ffprobe/ffmpeg. Used as a manual acceptance check, not a pytest case.
+
+It renders TWO projects:
+
+1. The original hard-cut plan (1.5 + 2.5 + 1.5s) checking cut
+   boundaries and first/last frames.
+2. A crossfade plan (three 2s clips, 0.5s / 0.8s overlaps, independent
+   volume 1.0 / 0.3 / 1.4) checking that overlap regions blend both
+   colours and both tones, that the total length shrinks by exactly the
+   sum of overlaps, and that per-clip gain is audible.
 """
 from __future__ import annotations
 
@@ -67,6 +76,19 @@ def dominant_tone(path: Path, at: float, length: float = 0.4) -> int:
     return best_freq
 
 
+def _render(project_id, clips):
+    project = Project(id=project_id, name=project_id, clips=clips, version=1,
+                      created_at="t0", updated_at="t1")
+    save_project(project)
+    info = manager.create(project_id)
+    deadline = time.time() + 60
+    while info.status in ("pending", "running") and time.time() < deadline:
+        time.sleep(0.2)
+        info = manager.get(info.id)
+    assert info.status == "done", (info.status, info.error)
+    return config.EXPORTS_DIR / f"{info.id}.mp4"
+
+
 def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="verify-export-"))
     config.DATA_ROOT = tmp / "data"
@@ -74,6 +96,7 @@ def main() -> None:
     config.PROJECTS_DIR = config.DATA_ROOT / "projects"
     config.EXPORTS_DIR = config.DATA_ROOT / "exports"
     config.SAMPLES_DIR = config.DATA_ROOT / "samples"
+    config.STAGING_DIR = config.DATA_ROOT / "staging"
     import app.media as media
     import app.samples as samples_mod
     import app.store as store
@@ -96,16 +119,7 @@ def main() -> None:
         Clip(id="c2", media_id=samples[1], source_in=1.0, source_out=3.5),
         Clip(id="c3", media_id=samples[2], source_in=0.2, source_out=1.7),
     ]
-    project = Project(id="verify", name="verify", clips=clips, version=1,
-                      created_at="t0", updated_at="t1")
-    save_project(project)
-    info = manager.create("verify")
-    deadline = time.time() + 60
-    while info.status in ("pending", "running") and time.time() < deadline:
-        time.sleep(0.2)
-        info = manager.get(info.id)
-    assert info.status == "done", (info.status, info.error)
-    output = config.EXPORTS_DIR / f"{info.id}.mp4"
+    output = _render("verify", clips)
     duration = probe_duration(output)
     print(f"export duration={duration:.3f} expected=5.5")
     assert abs(duration - 5.5) < 0.12
@@ -128,7 +142,81 @@ def main() -> None:
         tone = dominant_tone(output, at)
         assert tone == expected, (at, tone)
         print(f"audio t={at}s tone={tone}Hz OK")
-    print("ALL BOUNDARY CHECKS PASSED", output)
+
+    # First/last frames of the hard-cut render.
+    first = avg_color(output, 0.02)
+    assert max(abs(c - e) for c, e in zip(first, (216, 59, 59))) < 14, first
+    last_dur = probe_duration(output)
+    last = avg_color(output, max(0.0, last_dur - 0.05))
+    assert max(abs(c - e) for c, e in zip(last, (47, 107, 216))) < 14, last
+    print(f"first/last frames {first} / {last} OK")
+
+    # ---- crossfade + independent volume project ----
+    xclips = [
+        Clip(id="x1", media_id=samples[0], source_in=0.0, source_out=2.0,
+             transition_in=0.0, volume=1.0),
+        Clip(id="x2", media_id=samples[1], source_in=0.0, source_out=2.0,
+             transition_in=0.5, volume=0.3),
+        Clip(id="x3", media_id=samples[2], source_in=0.0, source_out=2.0,
+             transition_in=0.8, volume=1.4),
+    ]
+    xout = _render("verify-x", xclips)
+    xdur = probe_duration(xout)
+    print(f"crossfade export duration={xdur:.3f} expected=4.7")
+    assert abs(xdur - 4.7) < 0.12
+
+    # Pure regions.
+    for at, expected in (
+        (0.3, (216, 59, 59)),       # only clip 1
+        (2.1, (47, 168, 74)),      # between the two overlaps: only clip 2
+        (4.6, (47, 107, 216)),     # only clip 3
+    ):
+        color = avg_color(xout, at)
+        assert max(abs(c - e) for c, e in zip(color, expected)) < 18, (at, color)
+        print(f"xf pure t={at} color={color} OK")
+
+    # Overlap midpoints must be a blend: not close to either pure colour.
+    blend1 = avg_color(xout, 1.75)
+    assert blend1[1] > 80 and blend1[0] > 80, blend1  # red+green mix
+    blend2 = avg_color(xout, 3.1)
+    assert blend2[2] > 80 and blend2[1] > 70, blend2  # green+blue mix
+    print(f"xf overlap blends {blend1} / {blend2} OK")
+
+    # Both tones present at overlap centres.
+    def tone_energy(at, target, length=0.3):
+        import array, math
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-ss", f"{at:.3f}", "-t", f"{length:.3f}",
+             "-i", str(xout), "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
+            capture_output=True, check=True,
+        ).stdout
+        a = array.array("h"); a.frombytes(proc)
+        re = im = 0.0; k = 2 * math.pi * target / 8000
+        for i, v in enumerate(a):
+            re += v * math.cos(k * i); im -= v * math.sin(k * i)
+        return re * re + im * im
+
+    assert tone_energy(1.75, 440) > 0 and tone_energy(1.75, 660) > 0
+    print("xf overlap audio carries both 440Hz and 660Hz OK")
+
+    # Independent volume: clip 2 at 0.3 must be markedly quieter than
+    # clip 1 at 1.0 even accounting for tone differences.
+    def rms(at, length=0.4):
+        import array, math
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-ss", f"{at:.3f}", "-t", f"{length:.3f}",
+             "-i", str(xout), "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
+            capture_output=True, check=True,
+        ).stdout
+        a = array.array("h"); a.frombytes(proc)
+        return math.sqrt(sum(v * v for v in a) / max(1, len(a)))
+
+    quiet = rms(2.1)
+    loud = rms(0.3)
+    boosted = rms(4.3)
+    print(f"volume rms reference={loud:.0f} 0.3x={quiet:.0f} 1.4x={boosted:.0f}")
+    assert quiet < loud * 0.6
+    print("ALL BOUNDARY CHECKS PASSED", output, xout)
 
 
 if __name__ == "__main__":

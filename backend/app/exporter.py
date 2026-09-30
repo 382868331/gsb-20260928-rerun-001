@@ -1,9 +1,15 @@
 """Render a project to a single MP4 with ffmpeg.
 
-The exporter uses the exact same ``compute_timeline`` result the UI
-previews: source in/out points and their running sums decide both the
-rendered cut points and the timeline positions. Video and audio are cut
-in one filter graph per clip, so they stay in lockstep.
+The exporter consumes the exact same ``compute_timeline`` result the UI
+previews: source in/out points, timeline positions, overlap transitions
+and per-clip volume all come from that one computation.
+
+Each source is trimmed (video+audio on the same PTS interval) and each
+clip's audio is scaled by its independent volume. Clips are then joined
+with ``xfade``/``acrossfade`` overlaps, so the rendered boundaries and
+volume ramps are identical to the preview's. A plain cut is rendered as
+a one-frame fade (the smallest xfade accepts), which is visually a hard
+cut; the final -t absorbs the sub-frame rounding.
 
 Jobs run in background threads. Cancelling terminates the running
 ffmpeg process; partial files are discarded and only a fully rendered
@@ -13,7 +19,6 @@ touches the saved project, which can always be reopened and edited.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import threading
 import uuid
@@ -32,6 +37,7 @@ OUTPUT_AUDIO_RATE = 48000
 OUTPUT_FPS = 30
 OUTPUT_W = 640
 OUTPUT_H = 360
+HARD_CUT_FADE = 1.0 / OUTPUT_FPS
 
 
 def _now() -> str:
@@ -102,9 +108,13 @@ class ExportManager:
 
     def _run(self, job: _Job) -> None:
         info = job.info
-        work_dir = EXPORTS_DIR / info.id
         final_path = EXPORTS_DIR / f"{info.id}.mp4"
+        # Render into a temp name in the same directory and rename only on
+        # success, so a cancelled/interrupted render can never leave a
+        # playable-but-partial file behind and re-export needs no cleanup.
+        partial_path = EXPORTS_DIR / f".{info.id}.part.mp4"
         try:
+            EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
             project = load_project(job.project_id)
             if project is None:
                 raise RuntimeError("工程不存在")
@@ -115,14 +125,12 @@ class ExportManager:
             if timeline.missing_media_ids:
                 raise RuntimeError("素材缺失：" + ", ".join(timeline.missing_media_ids))
 
-            work_dir.mkdir(parents=True, exist_ok=True)
             info.status = "running"
-            segments = self._render_segments(job, timeline, media_index, work_dir)
+            cmd = self._build_command(timeline, media_index, partial_path)
+            self._run_process(job, cmd)
             if job.cancel_event.is_set():
                 raise RuntimeError("导出已取消")
-            self._concat(segments, work_dir, final_path, job)
-            if job.cancel_event.is_set():
-                raise RuntimeError("导出已取消")
+            partial_path.replace(final_path)
             info.status = "done"
             info.progress = 1.0
             info.output_url = f"/api/exports/{info.id}/download"
@@ -134,142 +142,109 @@ class ExportManager:
                 info.status = "failed"
                 info.error = str(exc)
             info.finished_at = _now()
-            if final_path.exists():
+            for path in (final_path, partial_path):
                 try:
-                    final_path.unlink()
+                    path.unlink(missing_ok=True)
                 except OSError:
                     pass
         finally:
             EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
             atomic_write_json(EXPORTS_DIR / f"{info.id}.json", info.model_dump())
-            shutil.rmtree(work_dir, ignore_errors=True)
 
-    def _render_segments(
+    def _build_command(
         self,
-        job: _Job,
         timeline: Timeline,
         media_index: dict[str, MediaInfo],
-        work_dir: Path,
-    ) -> list[Path]:
-        segments: list[Path] = []
-        total = timeline.duration or 1.0
-        done_before = 0.0
-        for index, clip in enumerate(timeline.clips):
-            if job.cancel_event.is_set():
-                break
-            source = media_path(clip.media_id)
-            if not source.exists():
-                raise RuntimeError(f"素材缺失：{clip.media_id}")
-            output = work_dir / f"segment_{index:04d}.mp4"
-            self._render_one(
-                job,
-                source,
-                clip.source_in,
-                clip.duration,
-                output,
-                media_index[clip.media_id].has_audio,
-            )
-            segments.append(output)
-            done_before += clip.duration
-            job.info.progress = min(0.99, round(0.95 * done_before / total, 4))
-        return segments
-
-    def _render_one(
-        self,
-        job: _Job,
-        source: Path,
-        source_in: float,
-        duration: float,
         output: Path,
-        has_audio: bool,
-    ) -> None:
-        # Precise trim/atrim in one filter graph slices video and audio
-        # by the same PTS interval; anullsrc fills clips without audio
-        # so every segment has an identical stream layout for concat.
-        video_chain = (
-            f"[0:v]trim=start={source_in:.6f}:duration={duration:.6f},"
-            "setpts=PTS-STARTPTS,"
-            f"fps={OUTPUT_FPS},"
-            f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
-            f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black,"
-            "format=yuv420p[v]"
-        )
-        if has_audio:
-            audio_chain = (
-                f"[0:a]atrim=start={source_in:.6f}:duration={duration:.6f},"
-                "asetpts=PTS-STARTPTS,"
-                f"aresample={OUTPUT_AUDIO_RATE},"
-                "apad=whole_dur={:.6f}[a]".format(duration)
-            )
-        else:
-            audio_chain = (
-                f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={duration:.6f}[a]"
-            )
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(source),
-        ]
-        if not has_audio:
-            cmd += [
-                "-f",
-                "lavfi",
-                "-i",
-                f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={duration:.6f}",
-            ]
+    ) -> list[str]:
+        clips = timeline.clips
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        for clip in clips:
+            cmd += ["-i", str(media_path(clip.media_id))]
+        # One null-audio source is appended; clips without audio reference it.
+        null_index = len(clips)
+        max_duration = max(clip.duration for clip in clips)
         cmd += [
-            "-filter_complex",
-            f"{video_chain};{audio_chain}",
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-t",
-            f"{duration:.6f}",
+            "-f", "lavfi", "-i",
+            f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={max_duration:.6f}",
+        ]
+
+        filters: list[str] = []
+        video_labels: list[str] = []
+        audio_labels: list[str] = []
+        # xfade/acrossfade reject a zero-length transition and xfade
+        # truncates its output for sub-frame durations; one full frame is
+        # the smallest valid fade and renders as a visually hard cut.
+        for index, clip in enumerate(clips):
+            has_audio = media_index[clip.media_id].has_audio
+            filters.append(
+                f"[{index}:v]trim=start={clip.source_in:.6f}:duration={clip.duration:.6f},"
+                "setpts=PTS-STARTPTS,"
+                f"fps={OUTPUT_FPS},"
+                f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
+                f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black,"
+                "settb=AVTB,format=yuv420p"
+                f"[v{index}]"
+            )
+            if has_audio:
+                source_chain = (
+                    f"[{index}:a]atrim=start={clip.source_in:.6f}:duration={clip.duration:.6f},"
+                    "asetpts=PTS-STARTPTS,"
+                    f"aresample={OUTPUT_AUDIO_RATE}"
+                )
+            else:
+                source_chain = (
+                    f"[{null_index}:a]atrim=start=0:duration={clip.duration:.6f},"
+                    "asetpts=PTS-STARTPTS"
+                )
+            # Independent per-clip volume is applied before the crossfade
+            # ramps so overlaps mix the already-scaled material.
+            filters.append(f"{source_chain},volume={clip.volume:.6f}[a{index}]")
+            video_labels.append(f"[v{index}]")
+            audio_labels.append(f"[a{index}]")
+
+        if len(clips) == 1:
+            filters.append(f"{video_labels[0]}null[vmix]")
+            filters.append(f"{audio_labels[0]}anull[amix]")
+        else:
+            prev_v = video_labels[0]
+            prev_a = audio_labels[0]
+            composite_end = clips[0].duration
+            for index in range(1, len(clips)):
+                clip = clips[index]
+                fade = max(clip.transition_in, HARD_CUT_FADE)
+                is_last = index == len(clips) - 1
+                out_v = "[vmix]" if is_last else f"[vx{index}]"
+                out_a = "[amix]" if is_last else f"[ax{index}]"
+                # xfade offset is the moment inside the composited-so-far
+                # stream where the fade starts. A real overlap starts at
+                # clip.start; the 1ms hard-cut stand-in consumes 1ms of
+                # composite length that the timeline does not model, so
+                # its offset is composite_end - fade. The final -t trims
+                # the sub-frame remainder.
+                offset = max(0.0, composite_end - fade)
+                filters.append(
+                    f"{prev_v}{video_labels[index]}"
+                    f"xfade=transition=fade:duration={fade:.6f}:offset={offset:.6f}{out_v}"
+                )
+                filters.append(
+                    f"{prev_a}{audio_labels[index]}"
+                    f"acrossfade=d={fade:.6f}:c1=tri:c2=tri{out_a}"
+                )
+                composite_end = offset + clip.duration
+                if not is_last:
+                    prev_v = f"[vx{index}]"
+                    prev_a = f"[ax{index}]"
+
+        cmd += [
+            "-filter_complex", ";".join(filters),
+            "-map", "[vmix]", "-map", "[amix]",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-t", f"{timeline.duration + HARD_CUT_FADE * (len(clips) - 1):.6f}",
             str(output),
         ]
-        self._run_process(job, cmd)
-
-    def _concat(
-        self, segments: list[Path], work_dir: Path, final_path: Path, job: _Job
-    ) -> None:
-        list_file = work_dir / "concat.txt"
-        lines = []
-        for segment in segments:
-            escaped = str(segment).replace("'", "'\\''")
-            lines.append(f"file '{escaped}'")
-        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        # Identical codec parameters across segments -> stream-copy concat
-        # keeps exact boundaries without a second encode.
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c",
-            "copy",
-            str(final_path),
-        ]
-        self._run_process(job, cmd)
+        return cmd
 
     def _run_process(self, job: _Job, cmd: list[str]) -> None:
         process = subprocess.Popen(

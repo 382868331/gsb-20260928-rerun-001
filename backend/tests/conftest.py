@@ -141,6 +141,7 @@ def client(tmp_path, monkeypatch):
         "PROJECTS_DIR": data_root / "projects",
         "EXPORTS_DIR": data_root / "exports",
         "SAMPLES_DIR": data_root / "samples",
+        "STAGING_DIR": data_root / "staging",
     }
     monkeypatch.setattr(config, "DATA_ROOT", data_root)
     for name, target in dirs.items():
@@ -154,6 +155,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(store_module, "MEDIA_DIR", dirs["MEDIA_DIR"])
     monkeypatch.setattr(store_module, "PROJECTS_DIR", dirs["PROJECTS_DIR"])
     monkeypatch.setattr(exporter_module, "EXPORTS_DIR", dirs["EXPORTS_DIR"])
+    monkeypatch.setattr(config, "STAGING_DIR", dirs["STAGING_DIR"])
     config.ensure_dirs()
     samples = ensure_samples()
     yield DirectClient(), samples, config

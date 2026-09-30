@@ -13,6 +13,11 @@ class Clip(BaseModel):
     # Source range in seconds, inclusive start / exclusive end.
     source_in: float = Field(ge=0)
     source_out: float = Field(gt=0)
+    # Overlap crossfade with the *previous* clip, in seconds. 0 means a
+    # hard cut. Capped at compute time so it never eats the whole clip.
+    transition_in: float = Field(default=0.0, ge=0)
+    # Independent per-clip gain multiplier (1 = original volume).
+    volume: float = Field(default=1.0, ge=0, le=4.0)
 
     @field_validator("source_out")
     @classmethod
@@ -54,6 +59,9 @@ class TimelineClip(BaseModel):
     start: float  # position on the unified timeline
     end: float
     duration: float
+    # Effective overlap with the previous clip after clamping.
+    transition_in: float = 0.0
+    volume: float = 1.0
     source_in: float
     source_out: float
     media_missing: bool
