@@ -7,6 +7,22 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 
+class SpeedSegment(BaseModel):
+    # Boundaries are source-media timestamps. They intentionally do not
+    # move when a clip's in/out points are trimmed around them.
+    source_start: float = Field(ge=0)
+    source_end: float = Field(gt=0)
+    rate: float = Field(gt=0, le=8)
+
+    @field_validator("source_end")
+    @classmethod
+    def _end_after_start(cls, value, info):
+        start = info.data.get("source_start")
+        if start is not None and value <= start:
+            raise ValueError("speed segment source_end must be greater than source_start")
+        return value
+
+
 class Clip(BaseModel):
     id: str
     media_id: str
@@ -19,6 +35,9 @@ class Clip(BaseModel):
     # previous one. 0 means a hard cut; clips overlap on the timeline
     # while video/audio crossfade during the overlap.
     transition: float = Field(default=0.0, ge=0)
+    # Non-overlapping source-time intervals with playback rates. Source
+    # ranges outside these intervals play at normal speed.
+    speed_segments: list[SpeedSegment] = Field(default_factory=list)
 
     @field_validator("source_out")
     @classmethod
@@ -32,6 +51,11 @@ class Clip(BaseModel):
 class ProjectPayload(BaseModel):
     name: str = "未命名工程"
     clips: list[Clip] = Field(default_factory=list)
+
+
+class ExportPayload(BaseModel):
+    start: float = Field(default=0.0, ge=0)
+    end: float | None = Field(default=None, gt=0)
 
 
 class Project(BaseModel):
@@ -54,6 +78,16 @@ class MediaInfo(BaseModel):
     sha256: str | None = None
 
 
+class TimelineSpeedSegment(BaseModel):
+    # Start relative to the clip's rendered beginning (including the
+    # part used by its incoming transition).
+    clip_start: float
+    clip_end: float
+    source_start: float
+    source_end: float
+    rate: float
+
+
 class TimelineClip(BaseModel):
     clip_id: str
     media_id: str
@@ -69,6 +103,7 @@ class TimelineClip(BaseModel):
     volume: float
     media_missing: bool
     source_duration: float | None
+    speed_segments: list[TimelineSpeedSegment]
 
 
 class Timeline(BaseModel):

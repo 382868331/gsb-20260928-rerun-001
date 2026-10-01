@@ -50,8 +50,11 @@ export const api = {
     }),
   timeline: (id: string) =>
     request<Timeline>(`/api/projects/${id}/timeline`),
-  startExport: (id: string) =>
-    request<ExportInfo>(`/api/projects/${id}/exports`, { method: "POST" }),
+  startExport: (id: string, range?: { start: number; end: number }) =>
+    request<ExportInfo>(`/api/projects/${id}/exports`, {
+      method: "POST",
+      body: JSON.stringify(range ?? {}),
+    }),
   getExport: (id: string) => request<ExportInfo>(`/api/exports/${id}`),
   cancelExport: (id: string) =>
     request<{ cancelled: boolean }>(`/api/exports/${id}/cancel`, {

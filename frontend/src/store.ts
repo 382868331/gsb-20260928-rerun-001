@@ -1,9 +1,88 @@
 import { create } from "zustand";
 import { api } from "./api";
-import type { Clip, ExportInfo, MediaInfo, Project, Timeline } from "./types";
+import type {
+  Clip,
+  ExportInfo,
+  MediaInfo,
+  Project,
+  Timeline,
+  TimelineClip,
+  TimelineSpeedSegment,
+} from "./types";
 
 function makeClipId(): string {
   return `clip-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function round6(value: number): number {
+  return Math.round(value * 1e6) / 1e6;
+}
+
+function effectiveSpeedSegments(clip: Clip): TimelineSpeedSegment[] {
+  const sourceIn = Math.max(0, clip.source_in);
+  const sourceOut = Math.max(sourceIn, clip.source_out);
+  const ordered = [...clip.speed_segments].sort((a, b) =>
+    a.source_start === b.source_start
+      ? a.source_end - b.source_end
+      : a.source_start - b.source_start,
+  );
+  const pieces: TimelineSpeedSegment[] = [];
+  let sourceCursor = sourceIn;
+  let clipCursor = 0;
+  for (const segment of ordered) {
+    let start = Math.max(segment.source_start, sourceIn);
+    const end = Math.min(segment.source_end, sourceOut);
+    if (end <= start) continue;
+    if (start > sourceCursor) {
+      const sourceLength = start - sourceCursor;
+      pieces.push({
+        clip_start: round6(clipCursor),
+        clip_end: round6(clipCursor + sourceLength),
+        source_start: round6(sourceCursor),
+        source_end: round6(start),
+        rate: 1,
+      });
+      clipCursor += sourceLength;
+    }
+    if (start < sourceCursor) start = sourceCursor;
+    if (end <= start) continue;
+    const sourceLength = end - start;
+    const renderedLength = sourceLength / segment.rate;
+    pieces.push({
+      clip_start: round6(clipCursor),
+      clip_end: round6(clipCursor + renderedLength),
+      source_start: round6(start),
+      source_end: round6(end),
+      rate: segment.rate,
+    });
+    clipCursor += renderedLength;
+    sourceCursor = end;
+  }
+  if (sourceCursor < sourceOut) {
+    const sourceLength = sourceOut - sourceCursor;
+    pieces.push({
+      clip_start: round6(clipCursor),
+      clip_end: round6(clipCursor + sourceLength),
+      source_start: round6(sourceCursor),
+      source_end: round6(sourceOut),
+      rate: 1,
+    });
+  }
+  return pieces;
+}
+
+export function sourceTimeInClip(clip: TimelineClip, localTime: number): number {
+  const time = Math.min(Math.max(0, localTime), clip.duration);
+  for (const segment of clip.speed_segments) {
+    if (time <= segment.clip_end + 1e-7 || segment === clip.speed_segments.at(-1)) {
+      const inside = Math.min(
+        Math.max(0, time - segment.clip_start),
+        segment.clip_end - segment.clip_start,
+      );
+      return round6(segment.source_start + inside * segment.rate);
+    }
+  }
+  return clip.source_in;
 }
 
 /** Same math as backend compute_timeline: running sum of clip durations. */
@@ -16,35 +95,43 @@ export function computeLocalTimeline(
   const result = clips.map((clip, index) => {
     const item = media[clip.media_id];
     if (!item) missing.add(clip.media_id);
-    const duration = Math.max(0, clip.source_out - clip.source_in);
+    const speedPieces = effectiveSpeedSegments(clip);
+    const duration = round6(
+      speedPieces.reduce((total, piece) => total + piece.clip_end - piece.clip_start, 0),
+    );
     let transition = index === 0 ? 0 : Math.min(Math.max(0, clip.transition || 0), duration * 0.5);
     if (index > 0) {
       const previous = clips[index - 1];
-      const previousDuration = Math.max(0, previous.source_out - previous.source_in);
+      const previousDuration = effectiveSpeedSegments(previous).reduce(
+        (total, piece) => total + piece.clip_end - piece.clip_start,
+        0,
+      );
       transition = Math.min(transition, previousDuration * 0.5);
     }
-    transition = Math.round(transition * 1e6) / 1e6;
-    const start = Math.round(cursor * 1e6) / 1e6;
-    const end = Math.round((start + duration) * 1e6) / 1e6;
-    const nextCursor = index === 0 ? end : Math.round(start + duration - transition, 6);
-    return {
+    transition = round6(transition);
+    const start = round6(cursor);
+    const end = round6(start + duration);
+    const nextCursor = index === 0 ? end : round6(start + duration - transition);
+    const rendered = {
       clip_id: clip.id,
       media_id: clip.media_id,
       start,
       end,
-      transition_start: Math.round(start - transition, 6),
+      transition_start: round6(start - transition),
       transition,
-      duration: Math.round(duration * 1e6) / 1e6,
+      duration,
       source_in: clip.source_in,
       source_out: clip.source_out,
       volume: Math.max(0, Math.min(4, clip.volume ?? 1)),
       media_missing: !item,
       source_duration: item?.duration ?? null,
+      speed_segments: speedPieces,
     };
     cursor = nextCursor;
+    return rendered;
   });
   return {
-    duration: Math.round(cursor * 1e6) / 1e6,
+    duration: round6(cursor),
     clips: result,
     missing_media_ids: [...missing].sort(),
   };
@@ -59,6 +146,7 @@ interface EditorState {
   exportJob: ExportInfo | null;
   message: string | null;
   busy: boolean;
+  canUndoSpeed: boolean;
 
   loadMedia: () => Promise<void>;
   uploadMedia: (file: File) => Promise<void>;
@@ -73,15 +161,18 @@ interface EditorState {
   trimClip: (clipId: string, edge: "in" | "out", value: number) => void;
   setClipVolume: (clipId: string, value: number) => void;
   setClipTransition: (clipId: string, value: number) => void;
+  setClipSpeed: (clipId: string, sourceStart: number, sourceEnd: number, rate: number) => void;
+  undoLastSpeed: () => void;
   renameProject: (name: string) => void;
   selectClip: (clipId: string | null) => void;
-  startExport: () => Promise<void>;
+  startExport: (range?: { start: number; end: number }) => Promise<void>;
   pollExport: () => Promise<void>;
   cancelExport: () => Promise<void>;
   setMessage: (message: string | null) => void;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+const speedHistory: Array<{ clipId: string; speedSegments: Clip["speed_segments"] }> = [];
 
 export const useEditor = create<EditorState>((set, get) => ({
   media: [],
@@ -92,6 +183,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   exportJob: null,
   message: null,
   busy: false,
+  canUndoSpeed: false,
 
   setMessage: (message) => set({ message }),
 
@@ -124,6 +216,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       timeline: { duration: 0, clips: [], missing_media_ids: [] },
       selectedClipId: null,
       exportJob: null,
+      canUndoSpeed: false,
     });
     await get().loadProjects();
   },
@@ -136,6 +229,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       timeline,
       selectedClipId: project.clips[0]?.id ?? null,
       exportJob: null,
+      canUndoSpeed: false,
       message: timeline.missing_media_ids.length
         ? `工程已打开，但有 ${timeline.missing_media_ids.length} 段素材缺失，恢复后可继续导出`
         : "工程已打开，可以继续剪辑",
@@ -180,6 +274,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       source_out: Math.min(item.duration, Math.max(1, item.duration)),
       volume: 1,
       transition: 0,
+      speed_segments: [],
     };
     const clips = [...project.clips, clip];
     patchClips(set, get, clips, clip.id, true);
@@ -249,6 +344,61 @@ export const useEditor = create<EditorState>((set, get) => ({
     patchClips(set, get, clips, clipId, false);
   },
 
+  setClipSpeed: (clipId, sourceStart, sourceEnd, rate) => {
+    const { project, media } = get();
+    if (!project) return;
+    const target = project.clips.find((clip) => clip.id === clipId);
+    if (!target) return;
+    const sourceDuration = media.find((item) => item.id === target.media_id)?.duration ?? target.source_out;
+    const safeStart = Math.min(
+      Math.max(0, Math.round(sourceStart * 1000) / 1000),
+      Math.max(0, sourceDuration - 0.1),
+    );
+    const safeEnd = Math.min(
+      Math.max(safeStart + 0.1, Math.round(sourceEnd * 1000) / 1000),
+      sourceDuration,
+    );
+    const safeRate = Math.max(0.25, Math.min(4, Math.round(rate * 100) / 100));
+    const clips = project.clips.map((clip) => {
+      if (clip.id !== clipId) return clip;
+      const otherSegments = clip.speed_segments.filter(
+        (segment) =>
+          segment.source_start !== safeStart || segment.source_end !== safeEnd,
+      );
+      return {
+        ...clip,
+        speed_segments: safeRate === 1
+          ? otherSegments
+          : [
+              ...otherSegments,
+              { source_start: safeStart, source_end: safeEnd, rate: safeRate },
+            ],
+      };
+    });
+    patchClips(set, get, clips, clipId, false);
+    speedHistory.push({
+      clipId,
+      speedSegments: structuredClone(project.clips.find((clip) => clip.id === clipId)?.speed_segments ?? []),
+    });
+    set({ canUndoSpeed: true });
+    scheduleSave(set, get);
+  },
+
+  undoLastSpeed: () => {
+    const previous = speedHistory.pop();
+    if (!previous) return;
+    const currentProject = get().project;
+    if (!currentProject) return;
+    const clips = currentProject.clips.map((clip) =>
+      clip.id === previous.clipId
+        ? { ...clip, speed_segments: structuredClone(previous.speedSegments) }
+        : clip,
+    );
+    patchClips(set, get, clips, previous.clipId, false);
+    set({ canUndoSpeed: speedHistory.length > 0 });
+    scheduleSave(set, get);
+  },
+
   renameProject: (name) => {
     const { project } = get();
     if (!project) return;
@@ -258,11 +408,17 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   selectClip: (clipId) => set({ selectedClipId: clipId }),
 
-  startExport: async () => {
+  startExport: async (range) => {
     const { project } = get();
     if (!project) return;
     await get().save();
-    const job = await api.startExport(project.id);
+    const exportRange = range
+      ? {
+          start: Math.max(0, Math.min(range.start, range.end)),
+          end: Math.min(get().timeline?.duration ?? range.end, Math.max(range.start, range.end)),
+        }
+      : undefined;
+    const job = await api.startExport(project.id, exportRange);
     set({ exportJob: job, message: "导出已开始…" });
   },
 

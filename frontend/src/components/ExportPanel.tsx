@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Download, Loader2, XCircle } from "lucide-react";
 import { useEditor } from "../store";
 
@@ -10,6 +10,9 @@ export function ExportPanel() {
   const pollExport = useEditor((state) => state.pollExport);
   const cancelExport = useEditor((state) => state.cancelExport);
   const busy = useEditor((state) => state.busy);
+  const [rangeStart, setRangeStart] = useState(0);
+  const [rangeEnd, setRangeEnd] = useState(0);
+  const [selectedOnly, setSelectedOnly] = useState(false);
 
   useEffect(() => {
     if (job?.status !== "running" && job?.status !== "pending") return;
@@ -20,6 +23,12 @@ export function ExportPanel() {
   const blocked = !project || project.clips.length === 0;
   const missingCount = timeline?.missing_media_ids.length ?? 0;
   const active = job?.status === "running" || job?.status === "pending";
+  const duration = timeline?.duration ?? 0;
+
+  useEffect(() => {
+    setRangeStart(0);
+    setRangeEnd(duration);
+  }, [duration]);
 
   return (
     <section className="panel export-panel">
@@ -36,7 +45,11 @@ export function ExportPanel() {
         <button
           type="button"
           disabled={blocked || active || busy || missingCount > 0}
-          onClick={() => void startExport()}
+          onClick={() => void startExport(
+            selectedOnly
+              ? { start: Math.max(0, Math.min(rangeStart, duration)), end: Math.max(0, Math.min(rangeEnd, duration)) }
+              : undefined,
+          )}
         >
           {active ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
           导出 MP4
@@ -47,6 +60,35 @@ export function ExportPanel() {
           </button>
         )}
       </div>
+      <label className="export-range">
+        <input
+          type="checkbox"
+          checked={selectedOnly}
+          onChange={(event) => setSelectedOnly(event.target.checked)}
+        />
+        只导出选定区间
+      </label>
+      {selectedOnly && (
+        <div className="range-row">
+          <input
+            type="number"
+            min={0}
+            max={duration}
+            step={0.05}
+            value={rangeStart}
+            onChange={(event) => setRangeStart(Number(event.target.value))}
+          />
+          <span>至</span>
+          <input
+            type="number"
+            min={0}
+            max={duration}
+            step={0.05}
+            value={rangeEnd}
+            onChange={(event) => setRangeEnd(Number(event.target.value))}
+          />
+        </div>
+      )}
       {job && (
         <div className="job">
           <div className="job-row">

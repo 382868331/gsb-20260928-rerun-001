@@ -173,6 +173,20 @@ input, select {
 .trim-row { display: grid; grid-template-columns: 150px 1fr 70px; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
 .trim-row input { width: 100%; }
 .hint { color: var(--muted); margin: 12px 0 0; }
+.speed-editor {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto auto;
+  gap: 8px;
+  align-items: end;
+  padding: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.speed-editor label span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+.speed-editor input { width: 100%; }
+.export-range { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+.range-row { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; margin-top: 8px; }
 
 .export-actions { display: flex; gap: 8px; margin: 10px 0; }
 .job { border-top: 1px solid var(--border); padding-top: 10px; }

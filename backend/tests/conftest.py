@@ -17,7 +17,7 @@ from app import config  # noqa: E402
 from app import api as api_module  # noqa: E402
 from app import media as media_module  # noqa: E402
 from app import samples as samples_module  # noqa: E402
-from app.models import ProjectPayload  # noqa: E402
+from app.models import ExportPayload, ProjectPayload  # noqa: E402
 from app import store as store_module  # noqa: E402
 from app import exporter as exporter_module  # noqa: E402
 from app.config import ensure_dirs  # noqa: E402
@@ -106,7 +106,12 @@ class DirectClient:
             return self._call(api_module.create_project, payload=payload)
         m = re.fullmatch(r"/api/projects/([^/]+)/exports", path)
         if m:
-            return self._call(api_module.start_export, project_id=m.group(1))
+            payload = ExportPayload.model_validate(json_body or {})
+            return self._call(
+                api_module.start_export,
+                project_id=m.group(1),
+                payload=payload,
+            )
         m = re.fullmatch(r"/api/exports/([^/]+)/cancel", path)
         if m:
             return self._call(api_module.cancel_export, job_id=m.group(1))

@@ -14,8 +14,74 @@ together).
 
 from __future__ import annotations
 
-from .models import MediaInfo, Project, Timeline, TimelineClip
+from .models import MediaInfo, Project, Timeline, TimelineClip, TimelineSpeedSegment
 from .store import media_exists
+
+
+def _effective_speed_segments(clip) -> list[TimelineSpeedSegment]:
+    """Return source intervals covering the trimmed clip range.
+
+    Gaps between stored speed changes inherit rate 1. Segments are
+    clipped by the media range and never extend outside it.
+    """
+    source_in = round(max(0.0, float(clip.source_in)), 6)
+    source_out = round(max(source_in, float(clip.source_out)), 6)
+    ordered = sorted(clip.speed_segments, key=lambda item: (item.source_start, item.source_end))
+    pieces: list[TimelineSpeedSegment] = []
+    cursor = source_in
+    clip_cursor = 0.0
+    for segment in ordered:
+        start = round(max(segment.source_start, source_in), 6)
+        end = round(min(segment.source_end, source_out), 6)
+        if end <= start:
+            continue
+        if start > cursor:
+            source_length = round(start - cursor, 6)
+            pieces.append(TimelineSpeedSegment(
+                clip_start=round(clip_cursor, 6),
+                clip_end=round(clip_cursor + source_length, 6),
+                source_start=cursor,
+                source_end=start,
+                rate=1.0,
+            ))
+            clip_cursor = round(clip_cursor + source_length, 6)
+        # Defensive handling for overlapping saved intervals: the later
+        # interval wins over the already-covered source range.
+        if start < cursor:
+            start = cursor
+        if end <= start:
+            continue
+        source_length = round(end - start, 6)
+        rendered_length = source_length / max(0.000001, float(segment.rate))
+        pieces.append(TimelineSpeedSegment(
+            clip_start=round(clip_cursor, 6),
+            clip_end=round(clip_cursor + rendered_length, 6),
+            source_start=start,
+            source_end=end,
+            rate=round(max(0.000001, float(segment.rate)), 6),
+        ))
+        clip_cursor = round(clip_cursor + rendered_length, 6)
+        cursor = end
+    if cursor < source_out:
+        source_length = round(source_out - cursor, 6)
+        pieces.append(TimelineSpeedSegment(
+            clip_start=round(clip_cursor, 6),
+            clip_end=round(clip_cursor + source_length, 6),
+            source_start=cursor,
+            source_end=source_out,
+            rate=1.0,
+        ))
+    return pieces
+
+
+def source_time_in_clip(clip: TimelineClip, local_time: float) -> float:
+    """Map rendered time inside one clip to the shared A/V source time."""
+    time = min(max(0.0, local_time), clip.duration)
+    for segment in clip.speed_segments:
+        if time <= segment.clip_end + 1e-7 or segment is clip.speed_segments[-1]:
+            inside = min(max(0.0, time - segment.clip_start), segment.clip_end - segment.clip_start)
+            return round(segment.source_start + inside * segment.rate, 6)
+    return clip.source_in
 
 
 def compute_timeline(project: Project, media_index: dict[str, MediaInfo]) -> Timeline:
@@ -30,14 +96,15 @@ def compute_timeline(project: Project, media_index: dict[str, MediaInfo]) -> Tim
         if not exists:
             missing.add(clip.media_id)
 
-        duration = max(0.0, round(clip.source_out - clip.source_in, 6))
+        speed_pieces = _effective_speed_segments(clip)
+        duration = round(
+            sum(piece.clip_end - piece.clip_start for piece in speed_pieces), 6
+        )
         # The first clip cannot overlap anything; later clips may only
         # overlap by half of the shorter of the two adjacent clips.
         transition = 0.0 if index == 0 else min(max(0.0, float(clip.transition)), duration * 0.5)
         if clips:
-            prev = project.clips[index - 1]
-            prev_duration = max(0.0, prev.source_out - prev.source_in)
-            transition = min(transition, prev_duration * 0.5)
+            transition = min(transition, clips[-1].duration * 0.5)
         transition = round(transition, 6)
 
         start = round(cursor, 6)
@@ -57,6 +124,7 @@ def compute_timeline(project: Project, media_index: dict[str, MediaInfo]) -> Tim
                 volume=max(0.0, min(4.0, float(clip.volume))),
                 media_missing=not exists,
                 source_duration=source_duration,
+                speed_segments=speed_pieces,
             )
         )
         cursor = end if index == 0 else round(start + duration - transition, 6)

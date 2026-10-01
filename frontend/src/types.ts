@@ -15,6 +15,13 @@ export interface Clip {
   source_out: number;
   volume: number;
   transition: number;
+  speed_segments: SpeedSegment[];
+}
+
+export interface SpeedSegment {
+  source_start: number;
+  source_end: number;
+  rate: number;
 }
 
 export interface Project {
@@ -39,6 +46,15 @@ export interface TimelineClip {
   volume: number;
   media_missing: boolean;
   source_duration: number | null;
+  speed_segments: TimelineSpeedSegment[];
+}
+
+export interface TimelineSpeedSegment {
+  clip_start: number;
+  clip_end: number;
+  source_start: number;
+  source_end: number;
+  rate: number;
 }
 
 export interface Timeline {

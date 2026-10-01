@@ -5,7 +5,13 @@ import time
 
 
 def _wait_job(test_client, project_id, timeout=30.0):
-    created = test_client.post(f"/api/projects/{project_id}/exports").json()
+    return _wait_payload(test_client, project_id, None, timeout)
+
+
+def _wait_payload(test_client, project_id, payload, timeout=30.0):
+    created = test_client.post(
+        f"/api/projects/{project_id}/exports", json=payload
+    ).json()
     job_id = created["id"]
     deadline = time.time() + timeout
     status = created["status"]
@@ -180,3 +186,53 @@ def test_upload_is_deduplicated_and_original_untouched(client, tmp_path):
     media_list = test_client.get("/api/media").json()
     # Same content -> same media id, no duplicate entry.
     assert sum(item["id"] == media_id for item in media_list) == 1
+
+
+def test_speed_plan_persists_and_selected_range_exports(client):
+    test_client, samples, config = client
+    media_ids = list(samples)
+    payload = {
+        "name": "变速工程",
+        "clips": [
+            {
+                "id": "speed-clip",
+                "media_id": media_ids[0],
+                "source_in": 0.0,
+                "source_out": 4.0,
+                "speed_segments": [
+                    {"source_start": 1.0, "source_end": 3.0, "rate": 0.5}
+                ],
+            },
+            {
+                "id": "normal-clip",
+                "media_id": media_ids[1],
+                "source_in": 0.0,
+                "source_out": 1.0,
+                "transition": 0.25,
+            },
+        ],
+    }
+    project = test_client.post("/api/projects", json=payload).json()
+    timeline = test_client.get(f"/api/projects/{project['id']}/timeline").json()
+    assert timeline["duration"] == 6.75
+    assert timeline["clips"][0]["speed_segments"][1]["rate"] == 0.5
+
+    reopened = test_client.get(f"/api/projects/{project['id']}").json()
+    assert reopened["clips"][0]["speed_segments"] == payload["clips"][0]["speed_segments"]
+
+    job = _wait_payload(
+        test_client,
+        project["id"],
+        {"start": 0.75, "end": 1.25},
+    )
+    assert job["status"] == "done", job
+    output = config.EXPORTS_DIR / f"{job['id']}.mp4"
+    probe = json.loads(
+        __import__("subprocess").run(
+            ["ffprobe", "-v", "error", "-show_format", "-of", "json", str(output)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert abs(float(probe["format"]["duration"]) - 0.5) < 0.08

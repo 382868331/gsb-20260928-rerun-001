@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { api } from "../api";
 import type { Timeline, TimelineClip } from "../types";
-import { useEditor } from "../store";
+import { sourceTimeInClip, useEditor } from "../store";
 
 const PLAYBACK_FPS = 30;
 const AUDITION_PAD = 0.5;
@@ -20,6 +20,7 @@ interface LayerState {
   gain: GainNode | null;
   url: string;
   loadToken: number;
+  segmentIndex: number;
 }
 
 function formatTime(seconds: number): string {
@@ -46,8 +47,8 @@ export function Preview() {
   const loopRangeRef = useRef<{ start: number; end: number } | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const layersRef = useRef<LayerState[]>([
-    { video: null, source: null, gain: null, url: "", loadToken: 0 },
-    { video: null, source: null, gain: null, url: "", loadToken: 0 },
+    { video: null, source: null, gain: null, url: "", loadToken: 0, segmentIndex: -1 },
+    { video: null, source: null, gain: null, url: "", loadToken: 0, segmentIndex: -1 },
   ]);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
@@ -65,9 +66,13 @@ export function Preview() {
 
   const syncPreview = (time: number, shouldPlay: boolean) => {
     if (!timeline) return;
-    const active = activeClipsAt(timeline, time);
-    configureLayer(layersRef.current[0], active[0], time, shouldPlay && active.length > 0);
-    configureLayer(layersRef.current[1], active[1], time, shouldPlay && active.length > 1);
+  const active = activeClipsAt(timeline, time);
+  const firstIndex = timeline.clips.findIndex((clip) => clip.clip_id === active[0]?.clip_id);
+  const outgoingTransition = active[0] && firstIndex >= 0
+    ? (timeline.clips[firstIndex + 1]?.transition ?? 0)
+    : 0;
+  configureLayer(layersRef.current[0], active[0], time, shouldPlay && active.length > 0, outgoingTransition);
+  configureLayer(layersRef.current[1], active[1], time, shouldPlay && active.length > 1, active[1]?.transition ?? 0);
   };
 
   useEffect(() => {
@@ -118,6 +123,7 @@ export function Preview() {
     clip: TimelineClip | undefined,
     time: number,
     shouldPlay: boolean,
+    incomingTransition: number,
   ) => {
     const video = layer.video;
     if (!video) return;
@@ -125,19 +131,36 @@ export function Preview() {
       video.pause();
       if (layer.gain) layer.gain.gain.value = 0;
       video.style.opacity = "0";
+      layer.segmentIndex = -1;
       return;
     }
 
     const url = api.mediaStreamUrl(clip.media_id);
-    const fade =
-      clip.transition > 0 && time < clip.start
-        ? Math.max(0, Math.min(1, (time - clip.transition_start) / clip.transition))
-        : 1;
+    const fadeIn = clip.transition > 0 && time < clip.start
+      ? Math.max(0, Math.min(1, (time - clip.transition_start) / clip.transition))
+      : 1;
+    const fadeOut = incomingTransition > 0 && time >= clip.end - incomingTransition
+      ? Math.max(0, 1 - (time - (clip.end - incomingTransition)) / incomingTransition)
+      : 1;
+    const fade = Math.min(fadeIn, fadeOut);
     if (layer.gain) layer.gain.gain.value = clip.volume * fade;
     video.volume = 1;
     video.style.opacity = String(fade);
 
-    const sourceTime = clip.source_in + Math.max(0, time - clip.transition_start);
+    const localTime = Math.max(0, time - clip.transition_start);
+    const segmentIndex = Math.max(0, clip.speed_segments.findIndex(
+      (segment) =>
+        localTime >= segment.clip_start - 1e-7 &&
+        (localTime < segment.clip_end - 1e-7 || segment === clip.speed_segments.at(-1)),
+    ));
+    const speedSegment = clip.speed_segments[segmentIndex];
+    const playbackRate = speedSegment?.rate ?? 1;
+    const sourceTime = sourceTimeInClip(clip, localTime);
+    video.playbackRate = playbackRate;
+    video.preservesPitch = false;
+    (video as HTMLVideoElement & { mozPreservesPitch?: boolean }).mozPreservesPitch = false;
+    const crossedSpeedBoundary = layer.segmentIndex >= 0 && layer.segmentIndex !== segmentIndex;
+    layer.segmentIndex = segmentIndex;
     if (layer.url !== url) {
       layer.url = url;
       const token = ++layer.loadToken;
@@ -146,7 +169,7 @@ export function Preview() {
       video.onloadedmetadata = () => {
         if (token === layer.loadToken) video.currentTime = sourceTime;
       };
-    } else if (Math.abs(video.currentTime - sourceTime) > 0.08) {
+    } else if (crossedSpeedBoundary || Math.abs(video.currentTime - sourceTime) > 0.08) {
       video.currentTime = sourceTime;
     }
     if (shouldPlay) void video.play().catch(() => undefined);

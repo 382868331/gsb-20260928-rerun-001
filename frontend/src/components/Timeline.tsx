@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, Trash2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Gauge, RotateCcw, Trash2 } from "lucide-react";
 import { useEditor } from "../store";
 import type { Clip, MediaInfo } from "../types";
 
@@ -19,6 +19,9 @@ export function Timeline() {
   const trimClip = useEditor((state) => state.trimClip);
   const setClipVolume = useEditor((state) => state.setClipVolume);
   const setClipTransition = useEditor((state) => state.setClipTransition);
+  const setClipSpeed = useEditor((state) => state.setClipSpeed);
+  const undoLastSpeed = useEditor((state) => state.undoLastSpeed);
+  const canUndoSpeed = useEditor((state) => state.canUndoSpeed);
 
   if (!project || !timeline) return null;
   const index = new Map<string, MediaInfo>(media.map((item) => [item.id, item]));
@@ -81,6 +84,7 @@ export function Timeline() {
       </div>
 
       <ClipInspector
+        key={selected!.id}
         clip={selected}
         media={selectedMedia}
         onTrim={trimClip}
@@ -88,7 +92,11 @@ export function Timeline() {
         onRemove={removeClip}
         onVolume={setClipVolume}
         onTransition={setClipTransition}
+        onSpeed={setClipSpeed}
+        onUndoSpeed={undoLastSpeed}
+        canUndoSpeed={canUndoSpeed}
         maxTransition={maxTransition}
+        renderedDuration={selectedTimelineClip?.duration ?? 0}
         position={selected ? timeline.clips.findIndex((c) => c.clip_id === selected.id) : -1}
         total={project.clips.length}
       />
@@ -106,7 +114,11 @@ interface InspectorProps {
   onRemove: (clipId: string) => void;
   onVolume: (clipId: string, value: number) => void;
   onTransition: (clipId: string, value: number) => void;
+  onSpeed: (clipId: string, sourceStart: number, sourceEnd: number, rate: number) => void;
+  onUndoSpeed: () => void;
+  canUndoSpeed: boolean;
   maxTransition: number;
+  renderedDuration: number;
 }
 
 function ClipInspector({
@@ -119,12 +131,20 @@ function ClipInspector({
   onRemove,
   onVolume,
   onTransition,
+  onSpeed,
+  onUndoSpeed,
+  canUndoSpeed,
   maxTransition,
+  renderedDuration,
 }: InspectorProps) {
   if (!clip) {
     return <p className="hint">选择一个片段后可以裁切入点/出点或调整顺序。</p>;
   }
   const sourceDuration = media?.duration ?? Math.max(clip.source_out, 1);
+  const speedBoundary = clip.speed_segments.at(0);
+  const speedEnd = speedBoundary
+    ? Math.min(clip.source_out, speedBoundary.source_end)
+    : Math.min(clip.source_out, clip.source_in + Math.min(1, clip.source_out - clip.source_in));
   return (
     <div className="inspector">
       <div className="inspector-actions">
@@ -173,7 +193,8 @@ function ClipInspector({
         <strong>{formatDuration(clip.source_out)}</strong>
       </label>
       <span className="meta">
-        片段时长 {formatDuration(Math.max(0, clip.source_out - clip.source_in))}
+        素材范围 {formatDuration(Math.max(0, clip.source_out - clip.source_in))}
+        ，成片时长 {formatDuration(renderedDuration)}
         ，修改后后续片段位置自动级联变化。
       </span>
       <label className="trim-row">
@@ -188,6 +209,70 @@ function ClipInspector({
         />
         <strong>{(clip.volume ?? 1).toFixed(2)}×</strong>
       </label>
+      <div className="speed-editor">
+        <label>
+          <span>变速开始（素材时刻）</span>
+          <input
+            type="number"
+            min={clip.source_in}
+            max={Math.max(clip.source_in, speedEnd - 0.1)}
+            step={0.05}
+            defaultValue={speedBoundary?.source_start ?? clip.source_in}
+            name="speed-start"
+          />
+        </label>
+        <label>
+          <span>恢复原速（素材时刻）</span>
+          <input
+            type="number"
+            min={clip.source_in + 0.1}
+            max={clip.source_out}
+            step={0.05}
+            defaultValue={speedEnd}
+            name="speed-end"
+          />
+        </label>
+        <label>
+          <span>速度</span>
+          <input
+            type="number"
+            min={0.25}
+            max={4}
+            step={0.05}
+            defaultValue={speedBoundary?.rate ?? 0.5}
+            name="speed-rate"
+          />
+        </label>
+        <button
+          type="button"
+          className="secondary"
+          onClick={(event) => {
+            const form = event.currentTarget.closest(".speed-editor");
+            if (!form) return;
+            const value = (name: string) => Number((form.querySelector(`[name="${name}"]`) as HTMLInputElement).value);
+            onSpeed(clip.id, value("speed-start"), value("speed-end"), value("speed-rate"));
+          }}
+        >
+          <Gauge size={15} /> 应用变速
+        </button>
+        <button type="button" className="secondary" disabled={!canUndoSpeed} onClick={onUndoSpeed}>
+          <RotateCcw size={15} /> 撤销上次变速
+        </button>
+      </div>
+      {clip.speed_segments.length > 0 && (
+        <span className="meta">
+          当前安排：
+          {clip.speed_segments
+            .map((segment) =>
+              `${formatDuration(segment.source_start)}-${formatDuration(segment.source_end)} 为 ${segment.rate.toFixed(2)}×`,
+            )
+            .join("；")}
+          ；其余素材时刻为 1×。
+        </span>
+      )}
+      <span className="meta">
+        素材边界限制：入点不能早于 0，出点不能超过源素材；裁剪只会裁掉素材范围，不会移动速度边界；转场最长不能超过相邻两段成片时长的一半。
+      </span>
       <label className="trim-row">
         <span>与前段交叠转场</span>
         <input

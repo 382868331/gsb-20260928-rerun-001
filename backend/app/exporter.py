@@ -42,6 +42,8 @@ def _now() -> str:
 class _Job:
     info: ExportInfo
     project_id: str
+    range_start: float
+    range_end: float | None
     cancel_event: threading.Event
     process: subprocess.Popen | None = None
     process_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -52,7 +54,7 @@ class ExportManager:
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.Lock()
 
-    def create(self, project_id: str) -> ExportInfo:
+    def create(self, project_id: str, start: float = 0.0, end: float | None = None) -> ExportInfo:
         job_id = uuid.uuid4().hex
         info = ExportInfo(
             id=job_id,
@@ -61,7 +63,11 @@ class ExportManager:
             created_at=_now(),
         )
         job = _Job(
-            info=info, project_id=project_id, cancel_event=threading.Event()
+            info=info,
+            project_id=project_id,
+            range_start=max(0.0, start),
+            range_end=end,
+            cancel_event=threading.Event(),
         )
         with self._lock:
             self._jobs[job_id] = job
@@ -117,7 +123,14 @@ class ExportManager:
 
             work_dir.mkdir(parents=True, exist_ok=True)
             info.status = "running"
-            self._render_timeline(job, timeline, media_index, final_path)
+            self._render_timeline(job, timeline, media_index, work_dir / "full.mp4")
+            self._render_range(
+                job,
+                work_dir / "full.mp4",
+                final_path,
+                min(timeline.duration, job.range_start),
+                None if job.range_end is None else min(timeline.duration, job.range_end),
+            )
             if job.cancel_event.is_set():
                 raise RuntimeError("导出已取消")
             info.status = "done"
@@ -140,6 +153,25 @@ class ExportManager:
             EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
             atomic_write_json(EXPORTS_DIR / f"{info.id}.json", info.model_dump())
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    @staticmethod
+    def _render_range(
+        job: _Job,
+        source: Path,
+        final_path: Path,
+        start: float,
+        end: float | None,
+    ) -> None:
+        if end is None or end <= start:
+            shutil.copyfile(source, final_path)
+            return
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.6f}", "-i", str(source),
+            "-t", f"{end - start:.6f}", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
+            str(final_path),
+        ]
+        manager._run_process(job, cmd)
 
     def _render_timeline(
         self,
@@ -174,52 +206,72 @@ class ExportManager:
                 "-f",
                 "lavfi",
                 "-i",
-                f"anullsrc=r={OUTPUT_AUDIO_RATE}:cl=stereo:d={timeline.clips[clip_index].duration:.6f}",
+                "anullsrc=r={}:cl=stereo:d=86400".format(OUTPUT_AUDIO_RATE),
             ]
             filters.append(f"[{next_input}:a]anull[{label}]")
             silent_labels[clip_index] = label
             next_input += 1
 
         for index, clip in enumerate(timeline.clips):
-            video_filter = (
-                f"[{index}:v]trim=start={clip.source_in:.6f}:duration={clip.duration:.6f},"
-                "setpts=PTS-STARTPTS,"
-                f"fps={OUTPUT_FPS},"
-                f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
-                f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black,"
-                "format=yuv420p"
-            )
-            audio_source = (
-                f"[{silent_labels[index]}]"
-                if index in silent_labels
-                else f"[{index}:a]"
-            )
-            audio_filter = (
-                f"{audio_source}atrim=start={clip.source_in:.6f}:duration={clip.duration:.6f},"
-                "asetpts=PTS-STARTPTS,"
-                f"aresample={OUTPUT_AUDIO_RATE},"
-                "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates={},"
-                .format(OUTPUT_AUDIO_RATE)
-            )
-            volume = max(0.0, min(4.0, clip.volume))
-            if volume != 1.0:
-                video_filter += f",fade=t=in:st=0:d=0,volume={volume:.6f}"
-                audio_filter += f"volume={volume:.6f},"
-            if clip.transition > 0:
-                fade_out_start = max(0.0, clip.duration - clip.transition)
-                video_filter += (
-                    f",fade=t=out:st={fade_out_start:.6f}:d={clip.transition:.6f}"
+            piece_video_labels: list[str] = []
+            piece_audio_labels: list[str] = []
+            for piece_index, piece in enumerate(clip.speed_segments):
+                source_length = piece.source_end - piece.source_start
+                rendered_length = piece.clip_end - piece.clip_start
+                label = f"{index}_{piece_index}"
+                video_filter = (
+                    f"[{index}:v]trim=start={piece.source_start:.6f}:duration={source_length:.6f},"
+                    f"setpts=(PTS-STARTPTS)/{piece.rate:.6f},"
+                    f"fps={OUTPUT_FPS},"
+                    f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
+                    f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2:black,"
+                    "format=yuv420p,"
+                    f"trim=duration={rendered_length:.6f},setpts=PTS-STARTPTS,fps={OUTPUT_FPS}"
                 )
-                audio_filter += (
-                    f"afade=t=out:st={fade_out_start:.6f}:d={clip.transition:.6f},"
+                piece_video_labels.append(f"[pv{label}]")
+                filters.append(f"{video_filter}[pv{label}]")
+
+                audio_source = f"[{silent_labels[index]}]" if index in silent_labels else f"[{index}:a]"
+                audio_filter = (
+                    f"{audio_source}atrim=start={piece.source_start:.6f}:duration={source_length:.6f},"
+                    f"asetpts=(PTS-STARTPTS)/{piece.rate:.6f},"
+                    f"aresample={OUTPUT_AUDIO_RATE},"
+                    "aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates={},"
+                    f"atrim=duration={rendered_length:.6f},asetpts=PTS-STARTPTS,"
+                    f"volume={clip.volume:.6f}"
+                ).format(OUTPUT_AUDIO_RATE)
+                piece_audio_labels.append(f"[pa{label}]")
+                filters.append(f"{audio_filter}[pa{label}]")
+
+            if len(clip.speed_segments) == 1:
+                filters.append(f"{piece_video_labels[0]}null[v{index}]")
+                filters.append(f"{piece_audio_labels[0]}anull[a{index}]")
+            else:
+                filters.append(
+                    "".join(piece_video_labels)
+                    + f"concat=n={len(piece_video_labels)}:v=1:a=0[v{index}]"
                 )
-            if index > 0 and timeline.clips[index].transition > 0:
-                fade_in_duration = timeline.clips[index].transition
-                video_filter += f",fade=t=in:st=0:d={fade_in_duration:.6f}"
-                audio_filter += f"afade=t=in:st=0:d={fade_in_duration:.6f},"
-            audio_filter += f"apad=whole_dur={clip.duration:.6f}"
-            filters.append(f"{video_filter}[v{index}]")
-            filters.append(f"{audio_filter}[a{index}]")
+                filters.append(
+                    "".join(piece_audio_labels)
+                    + f"concat=n={len(piece_audio_labels)}:v=0:a=1[a{index}]"
+                )
+
+            outgoing_transition = (
+                timeline.clips[index + 1].transition
+                if index + 1 < len(timeline.clips)
+                else 0.0
+            )
+            if index > 0 and clip.transition > 0:
+                filters.append(f"[v{index}]fade=t=in:st=0:d={clip.transition:.6f}[vfi{index}]")
+                filters.append(f"[a{index}]afade=t=in:st=0:d={clip.transition:.6f}[afi{index}]")
+                filters.append(f"[vfi{index}]null[v{index}]")
+                filters.append(f"[afi{index}]anull[a{index}]")
+            if outgoing_transition > 0:
+                fade_out_start = max(0.0, clip.duration - outgoing_transition)
+                filters.append(f"[v{index}]fade=t=out:st={fade_out_start:.6f}:d={outgoing_transition:.6f}[vfo{index}]")
+                filters.append(f"[a{index}]afade=t=out:st={fade_out_start:.6f}:d={outgoing_transition:.6f}[afo{index}]")
+                filters.append(f"[vfo{index}]null[v{index}]")
+                filters.append(f"[afo{index}]anull[a{index}]")
 
         video_label = "v0"
         audio_label = "a0"
@@ -229,7 +281,8 @@ class ExportManager:
             next_audio = f"ax{index}"
             if clip.transition > 0:
                 filters.append(
-                    f"[{video_label}][v{index}]xfade=transition=fade:"
+                    f"[{video_label}]settb=AVTB,fps={OUTPUT_FPS}[vxpre{index}];"
+                    f"[vxpre{index}][v{index}]xfade=transition=fade:"
                     f"offset={clip.transition_start:.6f}:duration={clip.transition:.6f}[{next_video}]"
                 )
                 filters.append(

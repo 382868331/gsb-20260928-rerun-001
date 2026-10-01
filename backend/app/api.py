@@ -9,13 +9,13 @@ from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from . import media as media_service
 from .config import MEDIA_DIR, STAGING_DIR, ensure_dirs
 from .exporter import manager as export_manager
-from .models import Project, ProjectPayload
+from .models import ExportPayload, Project, ProjectPayload
 from .samples import ensure_samples
 from .store import list_projects, load_project, media_path, save_project
 from .timeline import compute_timeline
@@ -135,10 +135,13 @@ def project_timeline(project_id: str) -> dict:
 
 
 @app.post("/api/projects/{project_id}/exports")
-def start_export(project_id: str) -> dict:
+def start_export(project_id: str, payload: ExportPayload | None = Body(default=None)) -> dict:
     if load_project(project_id) is None:
         raise HTTPException(status_code=404, detail="工程不存在")
-    return export_manager.create(project_id).model_dump()
+    payload = payload if isinstance(payload, ExportPayload) else ExportPayload()
+    return export_manager.create(
+        project_id, start=payload.start, end=payload.end
+    ).model_dump()
 
 
 @app.get("/api/projects/{project_id}/exports")
