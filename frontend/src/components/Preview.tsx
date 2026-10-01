@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { api } from "../api";
 import type { Timeline, TimelineClip } from "../types";
+import { sourceTimeAt } from "../timeline";
 import { useEditor } from "../store";
 
 const PLAYBACK_FPS = 30;
@@ -137,7 +138,19 @@ export function Preview() {
     video.volume = 1;
     video.style.opacity = String(fade);
 
-    const sourceTime = clip.source_in + Math.max(0, time - clip.transition_start);
+    const localTime = Math.max(0, time - clip.transition_start);
+    const mapped = sourceTimeAt(clip, localTime);
+    const sourceTime = mapped.time;
+    const playbackRate = shouldPlay ? mapped.rate : 1;
+    video.playbackRate = playbackRate;
+    const pitchControlledVideo = video as HTMLVideoElement & {
+      preservesPitch?: boolean;
+      mozPreservesPitch?: boolean;
+      webkitPreservesPitch?: boolean;
+    };
+    pitchControlledVideo.preservesPitch = false;
+    pitchControlledVideo.mozPreservesPitch = false;
+    pitchControlledVideo.webkitPreservesPitch = false;
     if (layer.url !== url) {
       layer.url = url;
       const token = ++layer.loadToken;
@@ -146,8 +159,11 @@ export function Preview() {
       video.onloadedmetadata = () => {
         if (token === layer.loadToken) video.currentTime = sourceTime;
       };
-    } else if (Math.abs(video.currentTime - sourceTime) > 0.08) {
+    } else if (Math.abs(video.currentTime - sourceTime) > 0.12) {
       video.currentTime = sourceTime;
+    }
+    if (Math.abs(video.playbackRate - playbackRate) > 0.001) {
+      video.playbackRate = playbackRate;
     }
     if (shouldPlay) void video.play().catch(() => undefined);
     else video.pause();

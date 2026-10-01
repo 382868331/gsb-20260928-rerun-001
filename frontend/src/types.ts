@@ -6,6 +6,13 @@ export interface MediaInfo {
   height: number | null;
   has_audio: boolean;
   is_sample: boolean;
+  sha256?: string | null;
+}
+
+export interface SpeedSegment {
+  source_in: number;
+  source_out: number;
+  rate: number;
 }
 
 export interface Clip {
@@ -15,6 +22,7 @@ export interface Clip {
   source_out: number;
   volume: number;
   transition: number;
+  speed_segments?: SpeedSegment[];
 }
 
 export interface Project {
@@ -39,6 +47,16 @@ export interface TimelineClip {
   volume: number;
   media_missing: boolean;
   source_duration: number | null;
+  segments: TimelineSegment[];
+}
+
+export interface TimelineSegment {
+  source_in: number;
+  source_out: number;
+  start: number;
+  end: number;
+  duration: number;
+  rate: number;
 }
 
 export interface Timeline {

@@ -167,14 +167,24 @@ input, select {
 .clip-waves i:nth-child(3) { height: 55%; }
 .clip-waves i:nth-child(4) { height: 95%; }
 .clip-waves i:nth-child(5) { height: 35%; }
+.speed-marks { position: absolute; inset-inline: 8px; bottom: 6px; height: 5px; pointer-events: none; }
+.speed-marks i { position: absolute; height: 100%; border-radius: 99px; background: #ffd166; box-shadow: 0 0 8px rgba(255,209,102,.75); }
 
 .inspector { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .inspector-actions { display: flex; gap: 8px; }
 .trim-row { display: grid; grid-template-columns: 150px 1fr 70px; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
 .trim-row input { width: 100%; }
 .hint { color: var(--muted); margin: 12px 0 0; }
+.speed-editor { border: 1px solid var(--border); background: #111827; border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.speed-title { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--text); }
+.speed-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.speed-segments { display: flex; flex-wrap: wrap; gap: 6px; }
+.speed-chip { background: #302717; color: #ffd166; border: 1px solid #5c4923; border-radius: 999px; padding: 2px 8px; font-size: 11px; font-variant-numeric: tabular-nums; }
 
 .export-actions { display: flex; gap: 8px; margin: 10px 0; }
+.export-range { display: flex; align-items: end; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+.export-range label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.export-range input { width: 92px; }
 .job { border-top: 1px solid var(--border); padding-top: 10px; }
 .job-row { display: flex; justify-content: space-between; font-size: 13px; }
 .job progress { width: 100%; height: 8px; }

@@ -94,7 +94,7 @@ class DirectClient:
             return self._call(api_module.download_export, job_id=m.group(1))
         raise AssertionError(f"unknown GET {path}")
 
-    def post(self, path, json=None, files=None):
+    def post(self, path, json=None, files=None, params=None):
         json_body = json
         if path == "/api/media" and files:
             file_tuple = files["file"]
@@ -106,7 +106,12 @@ class DirectClient:
             return self._call(api_module.create_project, payload=payload)
         m = re.fullmatch(r"/api/projects/([^/]+)/exports", path)
         if m:
-            return self._call(api_module.start_export, project_id=m.group(1))
+            return self._call(
+                api_module.start_export,
+                project_id=m.group(1),
+                start=float((params or {}).get("start", 0.0)),
+                end=(params or {}).get("end"),
+            )
         m = re.fullmatch(r"/api/exports/([^/]+)/cancel", path)
         if m:
             return self._call(api_module.cancel_export, job_id=m.group(1))

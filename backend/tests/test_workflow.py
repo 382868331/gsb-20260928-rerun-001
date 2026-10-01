@@ -180,3 +180,67 @@ def test_upload_is_deduplicated_and_original_untouched(client, tmp_path):
     media_list = test_client.get("/api/media").json()
     # Same content -> same media id, no duplicate entry.
     assert sum(item["id"] == media_id for item in media_list) == 1
+
+
+def test_speed_plan_reopens_and_selected_range_exports_with_same_mapping(client):
+    test_client, samples, config = client
+    media_ids = list(samples)
+    payload = {
+        "name": "变速工程",
+        "clips": [
+            {
+                "id": "speed-clip",
+                "media_id": media_ids[0],
+                "source_in": 0.0,
+                "source_out": 3.0,
+                "speed_segments": [
+                    {"source_in": 0.0, "source_out": 2.0, "rate": 0.5}
+                ],
+            },
+            {
+                "id": "normal-clip",
+                "media_id": media_ids[1],
+                "source_in": 0.0,
+                "source_out": 1.0,
+            },
+        ],
+    }
+    saved = test_client.post("/api/projects", json=payload).json()
+    project_id = saved["id"]
+
+    timeline = test_client.get(f"/api/projects/{project_id}/timeline").json()
+    assert timeline["duration"] == 6.0
+    assert timeline["clips"][0]["segments"][0] == {
+        "source_in": 0.0,
+        "source_out": 2.0,
+        "start": 0.0,
+        "end": 4.0,
+        "duration": 4.0,
+        "rate": 0.5,
+    }
+
+    # Saved project still carries source-time speed data, while reopening
+    # resolves the same output mapping rather than caching old audio/PTS.
+    reopened = test_client.get(f"/api/projects/{project_id}").json()
+    assert reopened["clips"][0]["speed_segments"] == payload["clips"][0]["speed_segments"]
+    reopened_timeline = test_client.get(f"/api/projects/{project_id}/timeline").json()
+    assert reopened_timeline["duration"] == 6.0
+
+    job_json = test_client.post(
+        f"/api/projects/{project_id}/exports",
+        params={"start": 3.0, "end": 5.0},
+    ).json()
+    deadline = time.time() + 30
+    job = job_json
+    while job["status"] in ("pending", "running") and time.time() < deadline:
+        time.sleep(0.2)
+        job = test_client.get(f"/api/exports/{job['id']}").json()
+    assert job["status"] == "done", job
+    output = config.EXPORTS_DIR / f"{job['id']}.mp4"
+    probe = json.loads(
+        __import__("subprocess").run(
+            ["ffprobe", "-v", "error", "-show_format", "-of", "json", str(output)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    )
+    assert abs(float(probe["format"]["duration"]) - 2.0) < 0.12

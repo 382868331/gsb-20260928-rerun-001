@@ -50,8 +50,11 @@ export const api = {
     }),
   timeline: (id: string) =>
     request<Timeline>(`/api/projects/${id}/timeline`),
-  startExport: (id: string) =>
-    request<ExportInfo>(`/api/projects/${id}/exports`, { method: "POST" }),
+  startExport: (id: string, rangeStart = 0, rangeEnd?: number) => {
+    const params = new URLSearchParams({ start: String(rangeStart) });
+    if (rangeEnd !== undefined) params.set("end", String(rangeEnd));
+    return request<ExportInfo>(`/api/projects/${id}/exports?${params}`, { method: "POST" });
+  },
   getExport: (id: string) => request<ExportInfo>(`/api/exports/${id}`),
   cancelExport: (id: string) =>
     request<{ cancelled: boolean }>(`/api/exports/${id}/cancel`, {

@@ -1,53 +1,15 @@
 import { create } from "zustand";
 import { api } from "./api";
-import type { Clip, ExportInfo, MediaInfo, Project, Timeline } from "./types";
+import type { Clip, ExportInfo, MediaInfo, Project, SpeedSegment, Timeline } from "./types";
+import {
+  clipTimelineDuration,
+  computeLocalTimeline,
+  normalizeSpeedSegments,
+  round6,
+} from "./timeline";
 
 function makeClipId(): string {
   return `clip-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-/** Same math as backend compute_timeline: running sum of clip durations. */
-export function computeLocalTimeline(
-  clips: Clip[],
-  media: Record<string, MediaInfo>,
-): Timeline {
-  let cursor = 0;
-  const missing = new Set<string>();
-  const result = clips.map((clip, index) => {
-    const item = media[clip.media_id];
-    if (!item) missing.add(clip.media_id);
-    const duration = Math.max(0, clip.source_out - clip.source_in);
-    let transition = index === 0 ? 0 : Math.min(Math.max(0, clip.transition || 0), duration * 0.5);
-    if (index > 0) {
-      const previous = clips[index - 1];
-      const previousDuration = Math.max(0, previous.source_out - previous.source_in);
-      transition = Math.min(transition, previousDuration * 0.5);
-    }
-    transition = Math.round(transition * 1e6) / 1e6;
-    const start = Math.round(cursor * 1e6) / 1e6;
-    const end = Math.round((start + duration) * 1e6) / 1e6;
-    const nextCursor = index === 0 ? end : Math.round(start + duration - transition, 6);
-    return {
-      clip_id: clip.id,
-      media_id: clip.media_id,
-      start,
-      end,
-      transition_start: Math.round(start - transition, 6),
-      transition,
-      duration: Math.round(duration * 1e6) / 1e6,
-      source_in: clip.source_in,
-      source_out: clip.source_out,
-      volume: Math.max(0, Math.min(4, clip.volume ?? 1)),
-      media_missing: !item,
-      source_duration: item?.duration ?? null,
-    };
-    cursor = nextCursor;
-  });
-  return {
-    duration: Math.round(cursor * 1e6) / 1e6,
-    clips: result,
-    missing_media_ids: [...missing].sort(),
-  };
 }
 
 interface EditorState {
@@ -59,6 +21,7 @@ interface EditorState {
   exportJob: ExportInfo | null;
   message: string | null;
   busy: boolean;
+  canUndoSpeed: boolean;
 
   loadMedia: () => Promise<void>;
   uploadMedia: (file: File) => Promise<void>;
@@ -73,15 +36,19 @@ interface EditorState {
   trimClip: (clipId: string, edge: "in" | "out", value: number) => void;
   setClipVolume: (clipId: string, value: number) => void;
   setClipTransition: (clipId: string, value: number) => void;
+  setClipSpeed: (clipId: string, sourceIn: number, sourceOut: number, rate: number) => void;
+  clearClipSpeed: (clipId: string, sourceIn: number, sourceOut: number) => void;
+  undoLastSpeed: () => void;
   renameProject: (name: string) => void;
   selectClip: (clipId: string | null) => void;
-  startExport: () => Promise<void>;
+  startExport: (rangeStart?: number, rangeEnd?: number) => Promise<void>;
   pollExport: () => Promise<void>;
   cancelExport: () => Promise<void>;
   setMessage: (message: string | null) => void;
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastSpeedSnapshot: Clip[] | null = null;
 
 export const useEditor = create<EditorState>((set, get) => ({
   media: [],
@@ -92,6 +59,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   exportJob: null,
   message: null,
   busy: false,
+  canUndoSpeed: false,
 
   setMessage: (message) => set({ message }),
 
@@ -124,6 +92,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       timeline: { duration: 0, clips: [], missing_media_ids: [] },
       selectedClipId: null,
       exportJob: null,
+      canUndoSpeed: false,
     });
     await get().loadProjects();
   },
@@ -136,6 +105,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       timeline,
       selectedClipId: project.clips[0]?.id ?? null,
       exportJob: null,
+      canUndoSpeed: false,
       message: timeline.missing_media_ids.length
         ? `工程已打开，但有 ${timeline.missing_media_ids.length} 段素材缺失，恢复后可继续导出`
         : "工程已打开，可以继续剪辑",
@@ -180,6 +150,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       source_out: Math.min(item.duration, Math.max(1, item.duration)),
       volume: 1,
       transition: 0,
+      speed_segments: [],
     };
     const clips = [...project.clips, clip];
     patchClips(set, get, clips, clip.id, true);
@@ -222,6 +193,13 @@ export const useEditor = create<EditorState>((set, get) => ({
           maxDuration,
         );
       }
+      next.speed_segments = normalizeSpeedSegments(next.speed_segments ?? [])
+        .map((segment) => ({
+          ...segment,
+          source_in: Math.max(segment.source_in, next.source_in),
+          source_out: Math.min(segment.source_out, next.source_out),
+        }))
+        .filter((segment) => segment.source_out - segment.source_in >= 0.05);
       return next;
     });
     patchClips(set, get, clips, clipId, false);
@@ -239,14 +217,35 @@ export const useEditor = create<EditorState>((set, get) => ({
   },
 
   setClipTransition: (clipId, value) => {
-    const { project } = get();
+    const { project, timeline } = get();
     if (!project) return;
+    const clipIndex = project.clips.findIndex((clip) => clip.id === clipId);
+    if (clipIndex <= 0 || !timeline) return;
+    const maxTransition = Math.min(
+      clipTimelineDuration(project.clips[clipIndex]),
+      clipTimelineDuration(project.clips[clipIndex - 1]),
+    ) * 0.5;
     const clips = project.clips.map((clip) =>
       clip.id === clipId
-        ? { ...clip, transition: Math.max(0, Math.round(value * 1000) / 1000) }
+        ? { ...clip, transition: round6(Math.min(Math.max(0, value), maxTransition)) }
         : clip,
     );
     patchClips(set, get, clips, clipId, false);
+  },
+
+  setClipSpeed: (clipId, sourceIn, sourceOut, rate) => {
+    applySpeedChange(set, get, clipId, sourceIn, sourceOut, Math.max(0.1, Math.min(8, rate)));
+  },
+
+  clearClipSpeed: (clipId, sourceIn, sourceOut) => {
+    applySpeedChange(set, get, clipId, sourceIn, sourceOut, null);
+  },
+
+  undoLastSpeed: () => {
+    if (!lastSpeedSnapshot) return;
+    patchClips(set, get, lastSpeedSnapshot, null, true);
+    lastSpeedSnapshot = null;
+    set({ canUndoSpeed: false });
   },
 
   renameProject: (name) => {
@@ -258,11 +257,11 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   selectClip: (clipId) => set({ selectedClipId: clipId }),
 
-  startExport: async () => {
+  startExport: async (rangeStart = 0, rangeEnd) => {
     const { project } = get();
     if (!project) return;
     await get().save();
-    const job = await api.startExport(project.id);
+    const job = await api.startExport(project.id, rangeStart, rangeEnd);
     set({ exportJob: job, message: "导出已开始…" });
   },
 
@@ -300,6 +299,45 @@ function patchClips(
     timeline: computeLocalTimeline(clips, Object.fromEntries(media.map((m) => [m.id, m]))),
   });
   if (persist) scheduleSave(set, get);
+}
+
+function applySpeedChange(
+  set: (partial: Partial<EditorState>) => void,
+  get: () => EditorState,
+  clipId: string,
+  sourceIn: number,
+  sourceOut: number,
+  rate: number | null,
+) {
+  const { project } = get();
+  if (!project) return;
+  const target = project.clips.find((clip) => clip.id === clipId);
+  if (!target) return;
+  const start = round6(Math.max(target.source_in, Math.min(sourceIn, target.source_out - 0.05)));
+  const end = round6(Math.max(start + 0.05, Math.min(sourceOut, target.source_out)));
+  lastSpeedSnapshot = project.clips.map((clip) => structuredClone(clip));
+  const clips = project.clips.map((clip) => {
+    if (clip.id !== clipId) return clip;
+    const next: SpeedSegment[] = [];
+    for (const segment of normalizeSpeedSegments(clip.speed_segments ?? [])) {
+      if (segment.source_out <= start || segment.source_in >= end) {
+        next.push(segment);
+      } else {
+        if (segment.source_in < start) {
+          next.push({ ...segment, source_out: start });
+        }
+        if (segment.source_out > end) {
+          next.push({ ...segment, source_in: end });
+        }
+      }
+    }
+    if (rate !== null && rate !== 1) {
+      next.push({ source_in: start, source_out: end, rate: round6(rate) });
+    }
+    return { ...clip, speed_segments: normalizeSpeedSegments(next) };
+  });
+  patchClips(set, get, clips, clipId, true);
+  set({ canUndoSpeed: true });
 }
 
 function scheduleSave(set: (partial: Partial<EditorState>) => void, get: () => EditorState) {

@@ -1,5 +1,7 @@
-import { ArrowLeft, ArrowRight, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { ArrowLeft, ArrowRight, RotateCcw, Trash2, Zap } from "lucide-react";
 import { useEditor } from "../store";
+import { clipTimelineDuration } from "../timeline";
 import type { Clip, MediaInfo } from "../types";
 
 function formatDuration(seconds: number): string {
@@ -19,6 +21,10 @@ export function Timeline() {
   const trimClip = useEditor((state) => state.trimClip);
   const setClipVolume = useEditor((state) => state.setClipVolume);
   const setClipTransition = useEditor((state) => state.setClipTransition);
+  const setClipSpeed = useEditor((state) => state.setClipSpeed);
+  const clearClipSpeed = useEditor((state) => state.clearClipSpeed);
+  const undoLastSpeed = useEditor((state) => state.undoLastSpeed);
+  const canUndoSpeed = useEditor((state) => state.canUndoSpeed);
 
   if (!project || !timeline) return null;
   const index = new Map<string, MediaInfo>(media.map((item) => [item.id, item]));
@@ -75,12 +81,25 @@ export function Timeline() {
               <div className="clip-waves" aria-hidden="true">
                 <i /><i /><i /><i /><i />
               </div>
+              <div className="speed-marks" aria-hidden="true">
+                {clip.segments.filter((segment) => segment.rate !== 1).map((segment) => (
+                  <i
+                    key={`${segment.source_in}-${segment.source_out}`}
+                    style={{
+                      left: `${(segment.start / clip.duration) * 100}%`,
+                      width: `${(segment.duration / clip.duration) * 100}%`,
+                    }}
+                    title={`${segment.rate}×：源 ${formatDuration(segment.source_in)} - ${formatDuration(segment.source_out)}`}
+                  />
+                ))}
+              </div>
             </div>
           );
         })}
       </div>
 
       <ClipInspector
+        key={selected?.id ?? "none"}
         clip={selected}
         media={selectedMedia}
         onTrim={trimClip}
@@ -88,6 +107,10 @@ export function Timeline() {
         onRemove={removeClip}
         onVolume={setClipVolume}
         onTransition={setClipTransition}
+        onSpeed={setClipSpeed}
+        onClearSpeed={clearClipSpeed}
+        onUndoSpeed={undoLastSpeed}
+        canUndoSpeed={canUndoSpeed}
         maxTransition={maxTransition}
         position={selected ? timeline.clips.findIndex((c) => c.clip_id === selected.id) : -1}
         total={project.clips.length}
@@ -106,10 +129,21 @@ interface InspectorProps {
   onRemove: (clipId: string) => void;
   onVolume: (clipId: string, value: number) => void;
   onTransition: (clipId: string, value: number) => void;
+  onSpeed: (clipId: string, sourceIn: number, sourceOut: number, rate: number) => void;
+  onClearSpeed: (clipId: string, sourceIn: number, sourceOut: number) => void;
+  onUndoSpeed: () => void;
+  canUndoSpeed: boolean;
   maxTransition: number;
 }
 
-function ClipInspector({
+function ClipInspector(props: InspectorProps) {
+  if (!props.clip) {
+    return <p className="hint">选择一个片段后可以裁切入点/出点或调整顺序。</p>;
+  }
+  return ClipInspectorBody({ ...props, clip: props.clip! });
+}
+
+function ClipInspectorBody({
   clip,
   media,
   position,
@@ -119,12 +153,19 @@ function ClipInspector({
   onRemove,
   onVolume,
   onTransition,
+  onSpeed,
+  onClearSpeed,
+  onUndoSpeed,
+  canUndoSpeed,
   maxTransition,
-}: InspectorProps) {
-  if (!clip) {
-    return <p className="hint">选择一个片段后可以裁切入点/出点或调整顺序。</p>;
-  }
+}: InspectorProps & { clip: Clip }) {
   const sourceDuration = media?.duration ?? Math.max(clip.source_out, 1);
+  const [speedStart, setSpeedStart] = useState(clip.source_in);
+  const [speedEnd, setSpeedEnd] = useState(clip.source_out);
+  const [rate, setRate] = useState(0.5);
+  const effectiveSpeedStart = Math.max(clip.source_in, Math.min(speedStart, speedEnd - 0.05));
+  const effectiveSpeedEnd = Math.min(clip.source_out, Math.max(speedEnd, effectiveSpeedStart + 0.05));
+  const outputDuration = clipTimelineDuration(clip);
   return (
     <div className="inspector">
       <div className="inspector-actions">
@@ -164,7 +205,7 @@ function ClipInspector({
         <span>出点（源 {formatDuration(sourceDuration)}）</span>
         <input
           type="range"
-          min={0.05}
+          min={clip.source_in + 0.05}
           max={sourceDuration}
           step={0.05}
           value={clip.source_out}
@@ -173,9 +214,58 @@ function ClipInspector({
         <strong>{formatDuration(clip.source_out)}</strong>
       </label>
       <span className="meta">
-        片段时长 {formatDuration(Math.max(0, clip.source_out - clip.source_in))}
-        ，修改后后续片段位置自动级联变化。
+        素材时长 {formatDuration(Math.max(0, clip.source_out - clip.source_in))}，
+        成片时长 {formatDuration(outputDuration)}；修改后后续片段位置自动级联变化。
       </span>
+      <div className="speed-editor">
+        <div className="speed-title">
+          <Zap size={14} /> 分段变速（声音随画面同时变速）
+        </div>
+        <label className="trim-row">
+          <span>变速入点</span>
+          <input type="range" min={clip.source_in} max={Math.max(clip.source_in, clip.source_out - 0.05)} step={0.05}
+            value={Math.min(Math.max(speedStart, clip.source_in), clip.source_out - 0.05)}
+            onChange={(event) => setSpeedStart(Number(event.target.value))} />
+          <strong>{formatDuration(effectiveSpeedStart)}</strong>
+        </label>
+        <label className="trim-row">
+          <span>变速出点</span>
+          <input type="range" min={Math.max(clip.source_in, speedStart + 0.05)} max={clip.source_out} step={0.05}
+            value={Math.max(Math.min(speedEnd, clip.source_out), effectiveSpeedStart + 0.05)}
+            onChange={(event) => setSpeedEnd(Number(event.target.value))} />
+          <strong>{formatDuration(effectiveSpeedEnd)}</strong>
+        </label>
+        <label className="trim-row">
+          <span>速度</span>
+          <input type="range" min={0.25} max={2} step={0.25} value={rate}
+            onChange={(event) => setRate(Number(event.target.value))} />
+          <strong>{rate.toFixed(2)}×</strong>
+        </label>
+        <div className="speed-actions">
+          <button type="button" className="secondary" disabled={effectiveSpeedEnd <= effectiveSpeedStart}
+            onClick={() => onSpeed(clip.id, effectiveSpeedStart, effectiveSpeedEnd, rate)}>
+            应用到此源区间
+          </button>
+          <button type="button" className="secondary" disabled={effectiveSpeedEnd <= effectiveSpeedStart}
+            onClick={() => onClearSpeed(clip.id, effectiveSpeedStart, effectiveSpeedEnd)}>
+            恢复原速
+          </button>
+          <button type="button" className="secondary" disabled={!canUndoSpeed} onClick={onUndoSpeed}>
+            <RotateCcw size={14} /> 撤销上一次变速
+          </button>
+        </div>
+        <div className="speed-segments">
+          {(clip.speed_segments ?? []).filter((segment) => segment.source_out > clip.source_in && segment.source_in < clip.source_out).map((segment) => (
+            <span key={`${segment.source_in}-${segment.source_out}`} className="speed-chip">
+              {formatDuration(segment.source_in)}→{formatDuration(segment.source_out)} · {segment.rate}×
+            </span>
+          ))}
+        </div>
+        <p className="meta">
+          变速范围不能越过当前入点/出点或素材结尾；缩短片段会裁掉范围外速度安排。
+          转场最长为相邻两个成片片段较短者的一半，变速改变时长后会按新时长限制。
+        </p>
+      </div>
       <label className="trim-row">
         <span>音量（0 静音，1 原音量）</span>
         <input

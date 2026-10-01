@@ -135,10 +135,10 @@ def project_timeline(project_id: str) -> dict:
 
 
 @app.post("/api/projects/{project_id}/exports")
-def start_export(project_id: str) -> dict:
+def start_export(project_id: str, start: float = 0.0, end: float | None = None) -> dict:
     if load_project(project_id) is None:
         raise HTTPException(status_code=404, detail="工程不存在")
-    return export_manager.create(project_id).model_dump()
+    return export_manager.create(project_id, start, end).model_dump()
 
 
 @app.get("/api/projects/{project_id}/exports")
