@@ -127,6 +127,11 @@ input, select {
 .error { color: var(--danger); margin: 8px 0 0; font-size: 13px; }
 
 .timeline-head { display: flex; justify-content: space-between; align-items: center; }
+.timeline-head-actions { display: flex; align-items: center; gap: 8px; }
+.timeline-head-actions button { padding: 4px 10px; font-size: 12px; }
+.library-upload { display: flex; gap: 8px; align-items: center; }
+.library-upload .danger { padding: 6px 10px; }
+.inspector-empty { border: 1px dashed var(--border); border-radius: 10px; padding: 4px 12px; }
 .track {
   position: relative;
   display: flex;

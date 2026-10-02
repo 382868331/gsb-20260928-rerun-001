@@ -254,7 +254,9 @@ export function Preview() {
 
   const auditionTransition = () => {
     if (!timeline) return;
-    const selectedIndex = timeline.clips.findIndex((clip) => clip.clip_id === selectedClipId);
+    const selectedIndex = selectedClipId
+      ? timeline.clips.findIndex((clip) => clip.clip_id === selectedClipId)
+      : -1;
     const incomingIndex = Math.max(
       1,
       selectedIndex > 0 ? selectedIndex : timeline.clips.findIndex((clip) => clip.transition > 0),
@@ -324,6 +326,9 @@ export function Preview() {
         <p className="warning">
           有 {missing} 段素材缺失；补齐同名素材后即可恢复，工程仍可继续编辑。
         </p>
+      )}
+      {duration === 0 && (
+        <p className="hint">空工程暂无可播放内容：从素材库添加片段后即可预览，当前工程可直接保存。</p>
       )}
     </section>
   );

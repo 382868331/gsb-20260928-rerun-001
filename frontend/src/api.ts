@@ -26,10 +26,14 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   listMedia: () => request<MediaInfo[]>("/api/media"),
-  uploadMedia: async (file: File): Promise<MediaInfo> => {
+  uploadMedia: async (file: File, signal?: AbortSignal): Promise<MediaInfo> => {
     const form = new FormData();
     form.append("file", file);
-    const response = await fetch("/api/media", { method: "POST", body: form });
+    const response = await fetch("/api/media", {
+      method: "POST",
+      body: form,
+      signal,
+    });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.detail ?? "上传失败");

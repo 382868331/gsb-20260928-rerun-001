@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, Gauge, RotateCcw, Trash2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Gauge, Redo2, Trash2, Undo2 } from "lucide-react";
 import { useEditor } from "../store";
 import type { Clip, MediaInfo } from "../types";
 
@@ -20,12 +20,15 @@ export function Timeline() {
   const setClipVolume = useEditor((state) => state.setClipVolume);
   const setClipTransition = useEditor((state) => state.setClipTransition);
   const setClipSpeed = useEditor((state) => state.setClipSpeed);
-  const undoLastSpeed = useEditor((state) => state.undoLastSpeed);
-  const canUndoSpeed = useEditor((state) => state.canUndoSpeed);
+  const undo = useEditor((state) => state.undo);
+  const redo = useEditor((state) => state.redo);
+  const canUndo = useEditor((state) => state.canUndo);
+  const canRedo = useEditor((state) => state.canRedo);
 
   if (!project || !timeline) return null;
   const index = new Map<string, MediaInfo>(media.map((item) => [item.id, item]));
-  const selected = project.clips.find((clip) => clip.id === selectedClipId) ?? null;
+  const selected =
+    project.clips.find((clip) => clip.id === selectedClipId && selectedClipId !== null) ?? null;
   const selectedMedia = selected ? (index.get(selected.media_id) ?? undefined) : undefined;
   const maxDuration = timeline.duration || 1;
   const selectedPosition = selected
@@ -41,12 +44,34 @@ export function Timeline() {
     <section className="panel timeline-panel">
       <div className="timeline-head">
         <h2>时间线（画面与声音共用）</h2>
-        <span className="meta">总时长 {formatDuration(timeline.duration)}</span>
+        <div className="timeline-head-actions">
+          <button
+            type="button"
+            className="secondary"
+            disabled={!canUndo}
+            onClick={undo}
+            title="撤销上一次编辑（添加/删除/裁剪/变速等）"
+          >
+            <Undo2 size={15} /> 撤销
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            disabled={!canRedo}
+            onClick={redo}
+            title="重做"
+          >
+            <Redo2 size={15} /> 重做
+          </button>
+          <span className="meta">总时长 {formatDuration(timeline.duration)}</span>
+        </div>
       </div>
 
       <div className="track" aria-label="统一音视频时间线">
         {timeline.clips.length === 0 && (
-          <div className="empty-track">从左侧素材库把视频加到这里</div>
+          <div className="empty-track">
+            时间线为空：从左侧素材库点「+」把视频加到这里，即可开始剪辑；工程会自动保存。
+          </div>
         )}
         {timeline.clips.map((clip, clipIndex) => {
           const item = index.get(clip.media_id) ?? undefined;
@@ -84,7 +109,7 @@ export function Timeline() {
       </div>
 
       <ClipInspector
-        key={selected!.id}
+        key={selected?.id ?? "none"}
         clip={selected}
         media={selectedMedia}
         onTrim={trimClip}
@@ -93,8 +118,6 @@ export function Timeline() {
         onVolume={setClipVolume}
         onTransition={setClipTransition}
         onSpeed={setClipSpeed}
-        onUndoSpeed={undoLastSpeed}
-        canUndoSpeed={canUndoSpeed}
         maxTransition={maxTransition}
         renderedDuration={selectedTimelineClip?.duration ?? 0}
         position={selected ? timeline.clips.findIndex((c) => c.clip_id === selected.id) : -1}
@@ -115,8 +138,6 @@ interface InspectorProps {
   onVolume: (clipId: string, value: number) => void;
   onTransition: (clipId: string, value: number) => void;
   onSpeed: (clipId: string, sourceStart: number, sourceEnd: number, rate: number) => void;
-  onUndoSpeed: () => void;
-  canUndoSpeed: boolean;
   maxTransition: number;
   renderedDuration: number;
 }
@@ -132,13 +153,19 @@ function ClipInspector({
   onVolume,
   onTransition,
   onSpeed,
-  onUndoSpeed,
-  canUndoSpeed,
   maxTransition,
   renderedDuration,
 }: InspectorProps) {
   if (!clip) {
-    return <p className="hint">选择一个片段后可以裁切入点/出点或调整顺序。</p>;
+    return (
+      <div className="inspector inspector-empty">
+        <p className="hint">
+          {total === 0
+            ? "当前是空工程。从左侧素材库添加素材后，这里会出现裁剪、变速、音量和转场参数。"
+            : "未选中片段。点击时间线上的任意片段即可编辑；也可以继续添加素材或保存、导出当前工程。"}
+        </p>
+      </div>
+    );
   }
   const sourceDuration = media?.duration ?? Math.max(clip.source_out, 1);
   const speedBoundary = clip.speed_segments.at(0);
@@ -254,9 +281,6 @@ function ClipInspector({
           }}
         >
           <Gauge size={15} /> 应用变速
-        </button>
-        <button type="button" className="secondary" disabled={!canUndoSpeed} onClick={onUndoSpeed}>
-          <RotateCcw size={15} /> 撤销上次变速
         </button>
       </div>
       {clip.speed_segments.length > 0 && (

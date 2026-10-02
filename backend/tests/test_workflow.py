@@ -38,6 +38,29 @@ def _create_project_with_clips(test_client, samples, outs=(2.0, 2.5, 1.5)):
     return test_client.post("/api/projects", json=payload).json()
 
 
+def test_empty_project_saves_reopens_and_rejects_export(client):
+    # An empty project is a first-class state: it must save, reopen and
+    # expose a zero-length timeline without errors.
+    test_client, samples, config = client
+    empty = test_client.post("/api/projects", json={"name": "空工程", "clips": []}).json()
+    empty_id = empty["id"]
+    timeline = test_client.get(f"/api/projects/{empty_id}/timeline").json()
+    assert timeline["clips"] == []
+    assert timeline["duration"] == 0
+    test_client.put(
+        f"/api/projects/{empty_id}", json={"name": "空工程", "clips": []}
+    )
+    reopened = test_client.get(f"/api/projects/{empty_id}").json()
+    assert reopened["clips"] == []
+    assert reopened["version"] == 2
+    listed = [p["id"] for p in test_client.get("/api/projects").json()]
+    assert empty_id in listed
+
+    job = _wait_job(test_client, empty_id)
+    assert job["status"] == "failed"
+    assert "空" in (job["error"] or "")
+
+
 def test_full_cut_reopen_export_and_boundaries(client):
     test_client, samples, config = client
     project = _create_project_with_clips(test_client, samples)

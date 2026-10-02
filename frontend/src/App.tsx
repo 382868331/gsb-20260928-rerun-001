@@ -10,6 +10,7 @@ export default function App() {
   const loadMedia = useEditor((state) => state.loadMedia);
   const loadProjects = useEditor((state) => state.loadProjects);
   const newProject = useEditor((state) => state.newProject);
+  const openProject = useEditor((state) => state.openProject);
   const project = useEditor((state) => state.project);
   const message = useEditor((state) => state.message);
   const setMessage = useEditor((state) => state.setMessage);
@@ -17,9 +18,13 @@ export default function App() {
   useEffect(() => {
     void loadMedia();
     void loadProjects().then(() => {
-      if (!useEditor.getState().project) void newProject();
+      if (useEditor.getState().project) return;
+      const latest = useEditor.getState().projects.find((item) => item.clips.length > 0)
+        ?? useEditor.getState().projects[0];
+      if (latest) void openProject(latest.id);
+      else void newProject();
     });
-  }, [loadMedia, loadProjects, newProject]);
+  }, [loadMedia, loadProjects, newProject, openProject]);
 
   return (
     <div className="app-shell">
@@ -37,7 +42,7 @@ export default function App() {
         <section className="main-area">
           <Preview />
           <Timeline />
-          {!project && <div className="loading">正在初始化工程…</div>}
+          {!project && <div className="loading">正在初始化或打开工程…</div>}
         </section>
       </main>
     </div>

@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { Film, Plus, Upload } from "lucide-react";
+import { Film, Plus, Upload, XCircle } from "lucide-react";
 import { useEditor } from "../store";
 
 function formatDuration(seconds: number): string {
@@ -12,7 +12,10 @@ export function MediaLibrary() {
   const media = useEditor((state) => state.media);
   const addClip = useEditor((state) => state.addClip);
   const uploadMedia = useEditor((state) => state.uploadMedia);
+  const cancelUpload = useEditor((state) => state.cancelUpload);
   const busy = useEditor((state) => state.busy);
+  const uploadingName = useEditor((state) => state.uploadingName);
+  const project = useEditor((state) => state.project);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   return (
@@ -20,14 +23,21 @@ export function MediaLibrary() {
       <h2>
         <Film size={18} /> 素材库
       </h2>
-      <button
-        type="button"
-        className="secondary"
-        disabled={busy}
-        onClick={() => inputRef.current?.click()}
-      >
-        <Upload size={16} /> 导入视频（原文件不会被覆盖）
-      </button>
+      <div className="library-upload">
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy}
+          onClick={() => inputRef.current?.click()}
+        >
+          <Upload size={16} /> 导入视频（原文件不会被覆盖）
+        </button>
+        {busy && uploadingName && (
+          <button type="button" className="danger" onClick={cancelUpload}>
+            <XCircle size={15} /> 取消载入
+          </button>
+        )}
+      </div>
       <input
         ref={inputRef}
         type="file"
@@ -52,6 +62,7 @@ export function MediaLibrary() {
             <button
               type="button"
               title="加到时间线末尾"
+              disabled={!project || busy}
               onClick={() => addClip(item.id)}
             >
               <Plus size={16} />

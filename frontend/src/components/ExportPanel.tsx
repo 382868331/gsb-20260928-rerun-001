@@ -41,6 +41,9 @@ export function ExportPanel() {
           存在 {missingCount} 段缺失素材，恢复素材文件后即可导出；工程已自动保存。
         </p>
       )}
+      {project && project.clips.length === 0 && (
+        <p className="hint">空工程没有可导出的内容，先从素材库添加片段；工程本身可以保存并稍后继续编辑。</p>
+      )}
       <div className="export-actions">
         <button
           type="button"
