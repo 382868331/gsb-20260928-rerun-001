@@ -12,6 +12,8 @@ export function MediaLibrary() {
   const media = useEditor((state) => state.media);
   const addClip = useEditor((state) => state.addClip);
   const uploadMedia = useEditor((state) => state.uploadMedia);
+  const cancelUpload = useEditor((state) => state.cancelUpload);
+  const uploading = useEditor((state) => state.uploading);
   const busy = useEditor((state) => state.busy);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -20,14 +22,21 @@ export function MediaLibrary() {
       <h2>
         <Film size={18} /> 素材库
       </h2>
-      <button
-        type="button"
-        className="secondary"
-        disabled={busy}
-        onClick={() => inputRef.current?.click()}
-      >
-        <Upload size={16} /> 导入视频（原文件不会被覆盖）
-      </button>
+      <div className="library-actions">
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy}
+          onClick={() => inputRef.current?.click()}
+        >
+          <Upload size={16} /> 导入视频（原文件不会被覆盖）
+        </button>
+        {uploading && (
+          <button type="button" className="danger" onClick={cancelUpload}>
+            取消载入
+          </button>
+        )}
+      </div>
       <input
         ref={inputRef}
         type="file"

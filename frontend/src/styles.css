@@ -127,6 +127,8 @@ input, select {
 .error { color: var(--danger); margin: 8px 0 0; font-size: 13px; }
 
 .timeline-head { display: flex; justify-content: space-between; align-items: center; }
+.timeline-head-actions { display: flex; align-items: center; gap: 8px; }
+.timeline-head-actions button { padding: 4px 10px; font-size: 12px; }
 .track {
   position: relative;
   display: flex;
@@ -138,6 +140,8 @@ input, select {
   margin-top: 10px;
 }
 .empty-track { color: var(--muted); margin: auto; }
+.empty-track { max-width: 520px; text-align: center; line-height: 1.6; padding: 0 16px; }
+.library-actions { display: flex; gap: 8px; align-items: center; }
 .track-clip {
   position: absolute;
   top: 6px;

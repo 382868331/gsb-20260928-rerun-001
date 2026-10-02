@@ -146,10 +146,15 @@ interface EditorState {
   exportJob: ExportInfo | null;
   message: string | null;
   busy: boolean;
-  canUndoSpeed: boolean;
+  uploading: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoLabel: string | null;
+  redoLabel: string | null;
 
-  loadMedia: () => Promise<void>;
+  loadMedia: () => Promise<boolean>;
   uploadMedia: (file: File) => Promise<void>;
+  cancelUpload: () => void;
   loadProjects: () => Promise<void>;
   newProject: () => Promise<void>;
   openProject: (id: string) => Promise<void>;
@@ -162,7 +167,8 @@ interface EditorState {
   setClipVolume: (clipId: string, value: number) => void;
   setClipTransition: (clipId: string, value: number) => void;
   setClipSpeed: (clipId: string, sourceStart: number, sourceEnd: number, rate: number) => void;
-  undoLastSpeed: () => void;
+  undo: () => void;
+  redo: () => void;
   renameProject: (name: string) => void;
   selectClip: (clipId: string | null) => void;
   startExport: (range?: { start: number; end: number }) => Promise<void>;
@@ -172,7 +178,26 @@ interface EditorState {
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
-const speedHistory: Array<{ clipId: string; speedSegments: Clip["speed_segments"] }> = [];
+
+interface EditSnapshot {
+  label: string;
+  kind: string;
+  clipId: string | null;
+  clips: Clip[];
+  selectedClipId: string | null;
+  at: number;
+}
+
+const COALESCE_MS = 700;
+type EditDraft = Omit<EditSnapshot, "at">;
+
+function cloneClips(clips: Clip[]): Clip[] {
+  return structuredClone(clips);
+}
+
+function sanitizeSelection(clips: Clip[], selectedClipId: string | null): string | null {
+  return clips.some((clip) => clip.id === selectedClipId) ? selectedClipId : null;
+}
 
 export const useEditor = create<EditorState>((set, get) => ({
   media: [],
@@ -183,26 +208,55 @@ export const useEditor = create<EditorState>((set, get) => ({
   exportJob: null,
   message: null,
   busy: false,
-  canUndoSpeed: false,
+  uploading: false,
+  canUndo: false,
+  canRedo: false,
+  undoLabel: null,
+  redoLabel: null,
 
   setMessage: (message) => set({ message }),
 
   loadMedia: async () => {
+    const token = ++loadMediaToken;
     const media = await api.listMedia();
+    if (token !== loadMediaToken) return false;
     set({ media });
+    return true;
   },
 
   uploadMedia: async (file) => {
-    set({ busy: true, message: `正在导入 ${file.name}…` });
+    if (uploadAbort) uploadAbort.abort();
+    const controller = new AbortController();
+    uploadAbort = controller;
+    set({ uploading: true, busy: true, message: `正在导入 ${file.name}…` });
+    const session = sessionToken;
+    const mediaToken = loadMediaToken;
     try {
-      await api.uploadMedia(file);
-      await get().loadMedia();
-      set({ message: `已导入：${file.name}（原文件不会被修改）` });
+      await api.uploadMedia(file, controller.signal);
+      const media = await api.listMedia();
+      if (controller.signal.aborted) return;
+      // Late results must never populate a project the user has left.
+      if (session !== sessionToken || mediaToken !== loadMediaToken) return;
+      set({
+        media,
+        message: `已导入：${file.name}（原文件不会被修改）。点击素材右侧 + 即可加入时间线。`,
+      });
     } catch (error) {
-      set({ message: (error as Error).message });
+      if (controller.signal.aborted || (error as Error).name === "AbortError") {
+        if (session === sessionToken) set({ message: `已取消导入：${file.name}` });
+        return;
+      }
+      if (session === sessionToken) set({ message: (error as Error).message });
     } finally {
-      set({ busy: false });
+      if (uploadAbort === controller) {
+        uploadAbort = null;
+        set({ uploading: false, busy: false });
+      }
     }
+  },
+
+  cancelUpload: () => {
+    uploadAbort?.abort();
   },
 
   loadProjects: async () => {
@@ -210,63 +264,85 @@ export const useEditor = create<EditorState>((set, get) => ({
   },
 
   newProject: async () => {
+    const token = beginSession();
+    cancelPendingSave();
     const project = await api.createProject(`未命名工程 ${Date.now() % 100000}`, []);
+    if (token !== sessionToken) return;
     set({
       project,
       timeline: { duration: 0, clips: [], missing_media_ids: [] },
       selectedClipId: null,
       exportJob: null,
-      canUndoSpeed: false,
+      message: "已建立空工程：从左侧素材库点 + 添加第一段素材即可开始剪辑。",
     });
+    resetHistory();
     await get().loadProjects();
   },
 
   openProject: async (id) => {
+    const token = beginSession();
+    cancelPendingSave();
     const project = await api.getProject(id);
+    if (token !== sessionToken) return;
     const timeline = await api.timeline(id);
+    if (token !== sessionToken) return;
+    const selectedClipId = sanitizeSelection(project.clips, project.clips[0]?.id ?? null);
     set({
       project,
       timeline,
-      selectedClipId: project.clips[0]?.id ?? null,
+      selectedClipId,
       exportJob: null,
-      canUndoSpeed: false,
-      message: timeline.missing_media_ids.length
+      message: project.clips.length === 0
+        ? "这是空工程：从左侧素材库点 + 添加素材后即可剪辑，也可以直接保存。"
+        : timeline.missing_media_ids.length
         ? `工程已打开，但有 ${timeline.missing_media_ids.length} 段素材缺失，恢复后可继续导出`
         : "工程已打开，可以继续剪辑",
     });
+    resetHistory();
   },
 
   save: async () => {
+    cancelPendingSave();
+    pendingSave = null;
     const { project } = get();
     if (!project) return;
+    const session = sessionToken;
+    const projectId = project.id;
+    const payload = cloneClips(project.clips);
     set({ busy: true });
     try {
-      const saved = await api.saveProject(
-        project.id,
-        project.name,
-        project.clips,
-      );
+      const saved = await api.saveProject(projectId, project.name, payload);
+      if (session !== sessionToken || get().project?.id !== projectId) return;
       set({ project: saved });
-      await get().refreshTimeline();
+      const timeline = await api.timeline(projectId);
+      if (session !== sessionToken || get().project?.id !== projectId) return;
+      set({ timeline });
       await get().loadProjects();
     } catch (error) {
-      set({ message: (error as Error).message });
+      if (session === sessionToken) set({ message: `保存未生效：${(error as Error).message}` });
     } finally {
-      set({ busy: false });
+      if (session === sessionToken) set({ busy: false });
     }
   },
 
   refreshTimeline: async () => {
     const { project } = get();
     if (!project) return;
-    set({ timeline: await api.timeline(project.id) });
+    const projectId = project.id;
+    const session = sessionToken;
+    const timeline = await api.timeline(projectId);
+    if (session !== sessionToken || get().project?.id !== projectId) return;
+    set({ timeline });
   },
 
   addClip: (mediaId) => {
     const { project, media } = get();
     if (!project) return;
     const item = media.find((entry) => entry.id === mediaId);
-    if (!item) return;
+    if (!item) {
+      set({ message: "素材尚未载入完成，添加没有生效；请稍后再试。" });
+      return;
+    }
     const clip: Clip = {
       id: makeClipId(),
       media_id: mediaId,
@@ -277,30 +353,64 @@ export const useEditor = create<EditorState>((set, get) => ({
       speed_segments: [],
     };
     const clips = [...project.clips, clip];
-    patchClips(set, get, clips, clip.id, true);
+    applyEdit(get, set, {
+      label: `添加「${item.filename}」`,
+      kind: "add",
+      clipId: clip.id,
+      clips,
+      selectedClipId: clip.id,
+    });
   },
 
   removeClip: (clipId) => {
     const { project } = get();
     if (!project) return;
+    const target = project.clips.find((clip) => clip.id === clipId);
+    if (!target) {
+      set({ message: "要删除的片段已不存在，本次编辑没有生效；之前的内容保持不变。" });
+      return;
+    }
     const clips = project.clips.filter((clip) => clip.id !== clipId);
-    patchClips(set, get, clips, null, true);
+    const media = get().media.find((entry) => entry.id === target.media_id);
+    // Clearing the selection makes the empty/no-selection state explicit
+    // instead of silently pointing at another clip.
+    applyEdit(get, set, {
+      label: `删除「${media?.filename ?? "片段"}」`,
+      kind: "remove",
+      clipId,
+      clips,
+      selectedClipId: null,
+    });
   },
 
   moveClip: (clipId, direction) => {
     const { project } = get();
     if (!project) return;
+    if (!project.clips.some((clip) => clip.id === clipId)) {
+      set({ message: "要移动的片段已不存在，本次编辑没有生效；之前的内容保持不变。" });
+      return;
+    }
     const index = project.clips.findIndex((clip) => clip.id === clipId);
     const target = index + direction;
-    if (index < 0 || target < 0 || target >= project.clips.length) return;
+    if (target < 0 || target >= project.clips.length) return;
     const clips = [...project.clips];
     [clips[index], clips[target]] = [clips[target], clips[index]];
-    patchClips(set, get, clips, clipId, true);
+    applyEdit(get, set, {
+      label: direction < 0 ? "片段前移" : "片段后移",
+      kind: "move",
+      clipId,
+      clips,
+      selectedClipId: clipId,
+    });
   },
 
   trimClip: (clipId, edge, value) => {
     const { project, media } = get();
     if (!project) return;
+    if (!project.clips.some((clip) => clip.id === clipId)) {
+      set({ message: "要裁剪的片段已不存在，本次编辑没有生效；之前的内容保持不变。" });
+      return;
+    }
     const clips = project.clips.map((clip) => {
       if (clip.id !== clipId) return clip;
       const item = media.find((entry) => entry.id === clip.media_id);
@@ -319,36 +429,65 @@ export const useEditor = create<EditorState>((set, get) => ({
       }
       return next;
     });
-    patchClips(set, get, clips, clipId, false);
+    coalesceOrPushEdit(get, set, {
+      label: edge === "in" ? "调整入点" : "调整出点",
+      kind: edge === "in" ? "trim-in" : "trim-out",
+      clipId,
+      clips,
+      selectedClipId: clipId,
+    });
   },
 
   setClipVolume: (clipId, value) => {
     const { project } = get();
     if (!project) return;
+    if (!project.clips.some((clip) => clip.id === clipId)) {
+      set({ message: "要调音量的片段已不存在，本次编辑没有生效；之前的内容保持不变。" });
+      return;
+    }
     const clips = project.clips.map((clip) =>
       clip.id === clipId
         ? { ...clip, volume: Math.max(0, Math.min(4, Math.round(value * 100) / 100)) }
         : clip,
     );
-    patchClips(set, get, clips, clipId, false);
+    coalesceOrPushEdit(get, set, {
+      label: "调整音量",
+      kind: "volume",
+      clipId,
+      clips,
+      selectedClipId: clipId,
+    });
   },
 
   setClipTransition: (clipId, value) => {
     const { project } = get();
     if (!project) return;
+    if (!project.clips.some((clip) => clip.id === clipId)) {
+      set({ message: "要调转场的片段已不存在，本次编辑没有生效；之前的内容保持不变。" });
+      return;
+    }
     const clips = project.clips.map((clip) =>
       clip.id === clipId
         ? { ...clip, transition: Math.max(0, Math.round(value * 1000) / 1000) }
         : clip,
     );
-    patchClips(set, get, clips, clipId, false);
+    coalesceOrPushEdit(get, set, {
+      label: "调整转场",
+      kind: "transition",
+      clipId,
+      clips,
+      selectedClipId: clipId,
+    });
   },
 
   setClipSpeed: (clipId, sourceStart, sourceEnd, rate) => {
     const { project, media } = get();
     if (!project) return;
     const target = project.clips.find((clip) => clip.id === clipId);
-    if (!target) return;
+    if (!target) {
+      set({ message: "要变速的片段已不存在，本次编辑没有生效；之前确认的速度安排保持不变。" });
+      return;
+    }
     const sourceDuration = media.find((item) => item.id === target.media_id)?.duration ?? target.source_out;
     const safeStart = Math.min(
       Math.max(0, Math.round(sourceStart * 1000) / 1000),
@@ -375,50 +514,84 @@ export const useEditor = create<EditorState>((set, get) => ({
             ],
       };
     });
-    patchClips(set, get, clips, clipId, false);
-    speedHistory.push({
+    applyEdit(get, set, {
+      label: safeRate === 1 ? "取消一段变速" : `应用 ${safeRate.toFixed(2)}× 变速`,
+      kind: "speed",
       clipId,
-      speedSegments: structuredClone(project.clips.find((clip) => clip.id === clipId)?.speed_segments ?? []),
+      clips,
+      selectedClipId: clipId,
     });
-    set({ canUndoSpeed: true });
-    scheduleSave(set, get);
   },
 
-  undoLastSpeed: () => {
-    const previous = speedHistory.pop();
-    if (!previous) return;
-    const currentProject = get().project;
-    if (!currentProject) return;
-    const clips = currentProject.clips.map((clip) =>
-      clip.id === previous.clipId
-        ? { ...clip, speed_segments: structuredClone(previous.speedSegments) }
-        : clip,
-    );
-    patchClips(set, get, clips, previous.clipId, false);
-    set({ canUndoSpeed: speedHistory.length > 0 });
-    scheduleSave(set, get);
+  undo: () => {
+    const snapshot = undoStack.pop();
+    const { project } = get();
+    if (!snapshot || !project) {
+      if (snapshot) undoStack.push(snapshot);
+      return;
+    }
+    redoStack.push({
+      label: snapshot.label,
+      kind: snapshot.kind,
+      clipId: snapshot.clipId,
+      clips: cloneClips(project.clips),
+      selectedClipId: sanitizeSelection(project.clips, get().selectedClipId),
+      at: Date.now(),
+    });
+    commitSnapshot(set, get, snapshot);
+    set({ message: `已撤销：${snapshot.label}` });
+  },
+
+  redo: () => {
+    const snapshot = redoStack.pop();
+    const { project } = get();
+    if (!snapshot || !project) {
+      if (snapshot) redoStack.push(snapshot);
+      return;
+    }
+    undoStack.push({
+      label: snapshot.label,
+      kind: snapshot.kind,
+      clipId: snapshot.clipId,
+      clips: cloneClips(project.clips),
+      selectedClipId: sanitizeSelection(project.clips, get().selectedClipId),
+      at: Date.now(),
+    });
+    commitSnapshot(set, get, snapshot);
+    set({ message: `已重做：${snapshot.label}` });
   },
 
   renameProject: (name) => {
     const { project } = get();
     if (!project) return;
     set({ project: { ...project, name } });
-    scheduleSave(set, get);
+    scheduleSave();
   },
 
-  selectClip: (clipId) => set({ selectedClipId: clipId }),
+  selectClip: (clipId) => {
+    const { project } = get();
+    if (!project) return;
+    // Never let the media area, timeline or inspector reference a
+    // clip that no longer exists in this project.
+    set({ selectedClipId: sanitizeSelection(project.clips, clipId) });
+  },
 
   startExport: async (range) => {
     const { project } = get();
     if (!project) return;
     await get().save();
+    const afterSave = get().project;
+    if (!afterSave || afterSave.id !== project.id) return;
     const exportRange = range
       ? {
           start: Math.max(0, Math.min(range.start, range.end)),
           end: Math.min(get().timeline?.duration ?? range.end, Math.max(range.start, range.end)),
         }
       : undefined;
-    const job = await api.startExport(project.id, exportRange);
+    const projectId = project.id;
+    const session = sessionToken;
+    const job = await api.startExport(projectId, exportRange);
+    if (session !== sessionToken || get().project?.id !== projectId) return;
     set({ exportJob: job, message: "导出已开始…" });
   },
 
@@ -441,26 +614,157 @@ export const useEditor = create<EditorState>((set, get) => ({
   },
 }));
 
-function patchClips(
+// ---- Session guards, edit history and queued persistence --------------
+
+let sessionToken = 0;
+let loadMediaToken = 0;
+let uploadAbort: AbortController | null = null;
+const undoStack: EditSnapshot[] = [];
+const redoStack: EditSnapshot[] = [];
+let pendingSave: { projectId: string; name: string; clips: Clip[] } | null = null;
+
+function beginSession(): number {
+  sessionToken += 1;
+  uploadAbort?.abort();
+  uploadAbort = null;
+  useEditor.setState({ busy: false, uploading: false });
+  // Flush any edits of the project we are leaving against the exact
+  // snapshot captured when the edit happened.
+  flushPendingSave();
+  return sessionToken;
+}
+
+function resetHistory() {
+  undoStack.length = 0;
+  redoStack.length = 0;
+  syncHistoryFlags(useEditor.setState);
+}
+function syncHistoryFlags(setState: (partial: Partial<EditorState>) => void) {
+  setState({
+    canUndo: undoStack.length > 0,
+    canRedo: redoStack.length > 0,
+    undoLabel: undoStack.at(-1)?.label ?? null,
+    redoLabel: redoStack.at(-1)?.label ?? null,
+  });
+}
+
+function mediaMap(media: MediaInfo[]): Record<string, MediaInfo> {
+  return Object.fromEntries(media.map((item) => [item.id, item]));
+}
+
+function commitSnapshot(
   set: (partial: Partial<EditorState>) => void,
   get: () => EditorState,
-  clips: Clip[],
-  selectedClipId: string | null,
-  persist: boolean,
+  snapshot: EditSnapshot,
 ) {
   const { project, media } = get();
   if (!project) return;
+  const clips = cloneClips(snapshot.clips);
+  const selectedClipId = sanitizeSelection(clips, snapshot.selectedClipId);
   set({
     project: { ...project, clips },
-    selectedClipId: selectedClipId ?? get().selectedClipId,
-    timeline: computeLocalTimeline(clips, Object.fromEntries(media.map((m) => [m.id, m]))),
+    selectedClipId,
+    timeline: computeLocalTimeline(clips, mediaMap(media)),
   });
-  if (persist) scheduleSave(set, get);
+  scheduleSave();
 }
 
-function scheduleSave(set: (partial: Partial<EditorState>) => void, get: () => EditorState) {
-  if (saveTimer) clearTimeout(saveTimer);
+function pushBeforeState(snapshot: EditDraft, before: { clips: Clip[]; selectedClipId: string | null }) {
+  undoStack.push({
+    label: snapshot.label,
+    kind: snapshot.kind,
+    clipId: snapshot.clipId,
+    clips: cloneClips(before.clips),
+    selectedClipId: before.selectedClipId,
+    at: Date.now(),
+  });
+  redoStack.length = 0;
+}
+
+function applyEdit(
+  get: () => EditorState,
+  set: (partial: Partial<EditorState>) => void,
+  next: EditDraft,
+) {
+  const { project, selectedClipId } = get();
+  if (!project) return;
+  if (JSON.stringify(next.clips) === JSON.stringify(project.clips)) return;
+  pushBeforeState(next, { clips: project.clips, selectedClipId });
+  commitSnapshot(set, get, { ...next, at: Date.now() });
+  syncHistoryFlags(set);
+}
+
+function coalesceOrPushEdit(
+  get: () => EditorState,
+  set: (partial: Partial<EditorState>) => void,
+  next: EditDraft,
+) {
+  const { project, selectedClipId } = get();
+  if (!project) return;
+  if (JSON.stringify(next.clips) === JSON.stringify(project.clips)) return;
+  const last = undoStack.at(-1);
+  if (
+    last &&
+    last.kind === next.kind &&
+    last.clipId === next.clipId &&
+    Date.now() - last.at < COALESCE_MS
+  ) {
+    // Keep the original pre-drag state; one undo reverts the whole drag.
+    last.at = Date.now();
+  } else {
+    pushBeforeState(next, { clips: project.clips, selectedClipId });
+  }
+  commitSnapshot(set, get, { ...next, at: Date.now() });
+  syncHistoryFlags(set);
+}
+
+function cancelPendingSave() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+}
+
+function flushPendingSave() {
+  cancelPendingSave();
+  const queued = pendingSave;
+  pendingSave = null;
+  if (!queued) return;
+  void api
+    .saveProject(queued.projectId, queued.name, queued.clips)
+    .catch(() => undefined);
+}
+
+function scheduleSave() {
+  const { project } = useEditor.getState();
+  if (!project) return;
+  // Capture the exact content so a project switch or late local edit
+  // cannot make the PUT carry another project's clips.
+  pendingSave = {
+    projectId: project.id,
+    name: project.name,
+    clips: cloneClips(project.clips),
+  };
+  cancelPendingSave();
   saveTimer = setTimeout(() => {
-    void get().save();
+    saveTimer = null;
+    const queued = pendingSave;
+    pendingSave = null;
+    if (!queued) return;
+    const session = sessionToken;
+    void (async () => {
+      try {
+        const saved = await api.saveProject(queued.projectId, queued.name, queued.clips);
+        const state = useEditor.getState();
+        if (session !== sessionToken || state.project?.id !== queued.projectId) return;
+        useEditor.setState({ project: saved, busy: false });
+        await state.refreshTimeline();
+        await state.loadProjects();
+      } catch (error) {
+        if (session === sessionToken) {
+          useEditor.setState({ message: `自动保存未生效：${(error as Error).message}` });
+        }
+      }
+    })();
   }, 600);
 }

@@ -281,6 +281,9 @@ export function Preview() {
         {currentClips.some((clip) => clip.media_missing) && (
           <div className="missing-badge">素材缺失，占位预览</div>
         )}
+        {timeline && timeline.clips.length === 0 && (
+          <div className="missing-badge">空工程：加入素材后即可预览</div>
+        )}
       </div>
       <div className="preview-controls">
         <button type="button" onClick={restart} title="回到开头">
