@@ -131,6 +131,21 @@ input, select {
 .timeline-head-actions button { padding: 4px 10px; font-size: 12px; }
 .library-upload { display: flex; gap: 8px; align-items: center; }
 .library-upload .danger { padding: 6px 10px; }
+.import-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.import-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.import-list li strong { display: block; font-size: 12px; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-list li.import-failed { border-color: var(--danger, #c05050); }
+.import-list li.import-done { border-style: solid; opacity: 0.8; }
+.import-list .done-icon { color: var(--ok); }
 .inspector-empty { border: 1px dashed var(--border); border-radius: 10px; padding: 4px 12px; }
 .track {
   position: relative;

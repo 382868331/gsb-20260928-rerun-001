@@ -139,6 +139,7 @@ export function computeLocalTimeline(
 
 interface EditorState {
   media: MediaInfo[];
+  imports: ImportTask[];
   projects: Project[];
   project: Project | null;
   timeline: Timeline | null;
@@ -146,14 +147,15 @@ interface EditorState {
   exportJob: ExportInfo | null;
   message: string | null;
   busy: boolean;
-  uploadingName: string | null;
   canUndo: boolean;
   canRedo: boolean;
   lastEditLabel: string | null;
 
-  loadMedia: (sessionToken?: number) => Promise<void>;
-  uploadMedia: (file: File) => Promise<void>;
-  cancelUpload: () => void;
+  loadMedia: () => Promise<void>;
+  uploadMedia: (files: File | File[]) => Promise<void>;
+  retryImport: (key: string) => Promise<void>;
+  cancelImport: (key: string) => void;
+  cancelAllImports: () => void;
   loadProjects: () => Promise<void>;
   newProject: () => Promise<void>;
   openProject: (id: string) => Promise<void>;
@@ -176,9 +178,30 @@ interface EditorState {
   setMessage: (message: string | null) => void;
 }
 
+export interface ImportTask {
+  key: string;
+  name: string;
+  status: "reading" | "done" | "failed" | "cancelled";
+  detail: string | null;
+  mediaId: string | null;
+}
+
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+// Project lifecycle: bumped whenever the user creates/opens a project so
+// late responses bound to the previous project are dropped.
 let sessionToken = 0;
-let uploadController: AbortController | null = null;
+// Media-library lifecycle: independent from the project lifecycle. The
+// media list belongs to the library, not to any project, so creating or
+// switching projects must never discard an in-flight media response.
+let mediaToken = 0;
+let mediaListRequest = 0;
+let importCounter = 0;
+// Per-import-task attempt sequence and abort handles. A retry bumps the
+// attempt counter, so a late response (or late abort) from an older
+// attempt can never overwrite the newer attempt's state.
+const importAttempts = new Map<string, number>();
+const importControllers = new Map<string, AbortController>();
+const importFiles = new Map<string, File>();
 
 interface HistoryEntry {
   label: string;
@@ -226,6 +249,7 @@ function ensureHistory(project: Project): ProjectHistory {
 
 export const useEditor = create<EditorState>((set, get) => ({
   media: [],
+  imports: [],
   projects: [],
   project: null,
   timeline: null,
@@ -233,49 +257,67 @@ export const useEditor = create<EditorState>((set, get) => ({
   exportJob: null,
   message: null,
   busy: false,
-  uploadingName: null,
   canUndo: false,
   canRedo: false,
   lastEditLabel: null,
 
   setMessage: (message) => set({ message }),
 
-  loadMedia: async (token = sessionToken) => {
+  loadMedia: async () => {
+    const token = mediaToken;
+    const requestId = ++mediaListRequest;
     const media = await api.listMedia();
-    if (token !== sessionToken) return;
+    // Media list belongs to the library lifecycle: only a newer list
+    // request (or an explicit library reset) may supersede this result.
+    if (token !== mediaToken || requestId !== mediaListRequest) return;
     set({ media });
   },
 
-  uploadMedia: async (file) => {
-    uploadController?.abort();
-    const controller = new AbortController();
-    uploadController = controller;
-    const token = sessionToken;
-    set({ busy: true, uploadingName: file.name, message: `正在导入 ${file.name}…` });
-    try {
-      await api.uploadMedia(file, controller.signal);
-      if (token !== sessionToken || uploadController !== controller) return;
-      await get().loadMedia(token);
-      if (token !== sessionToken || uploadController !== controller) return;
-      set({ message: `已导入：${file.name}（原文件不会被修改），可加入时间线` });
-    } catch (error) {
-      if ((error as Error).name === "AbortError" || controller.signal.aborted) {
-        if (uploadController === controller) {
-          set({ message: `已取消导入：${file.name}，工程未改动` });
-        }
-        return;
-      }
-      set({ message: (error as Error).message });
-    } finally {
-      if (uploadController === controller) {
-        uploadController = null;
-        set({ busy: false, uploadingName: null });
-      }
-    }
+  uploadMedia: async (files) => {
+    const list = Array.isArray(files) ? files : [files];
+    if (list.length === 0) return;
+    const batchToken = mediaToken;
+    const tasks: ImportTask[] = list.map((file) => ({
+      key: `import-${++importCounter}`,
+      name: file.name,
+      status: "reading",
+      detail: null,
+      mediaId: null,
+    }));
+    tasks.forEach((task, index) => importFiles.set(task.key, list[index]));
+    set({ imports: [...get().imports, ...tasks] });
+    // One import batch may mix existing files, files still being read
+    // and failures; each file resolves independently.
+    await Promise.all(
+      tasks.map((task, index) => runImport(task.key, list[index], get, set)),
+    );
+    if (mediaToken !== batchToken) return;
+    const done = tasks.filter((task) => latestImport(get, task.key)?.status === "done").length;
+    const failed = tasks.filter((task) => latestImport(get, task.key)?.status === "failed").length;
+    const cancelled = tasks.filter(
+      (task) => latestImport(get, task.key)?.status === "cancelled",
+    ).length;
+    const parts = [`${done} 个素材已就绪`];
+    if (failed) parts.push(`${failed} 个失败（可单独重试）`);
+    if (cancelled) parts.push(`${cancelled} 个已取消`);
+    set({ message: `导入结束：${parts.join("，")}` });
   },
 
-  cancelUpload: () => {
-    uploadController?.abort();
+  retryImport: async (key) => {
+    const file = importFiles.get(key);
+    const task = get().imports.find((item) => item.key === key);
+    // Safe even while a previous attempt is still settling: runImport
+    // aborts it and sequences the new attempt as the only writable one.
+    if (!file || !task) return;
+    await runImport(key, file, get, set);
+  },
+
+  cancelImport: (key) => {
+    importControllers.get(key)?.abort();
+  },
+
+  cancelAllImports: () => {
+    for (const controller of importControllers.values()) controller.abort();
   },
 
   loadProjects: async () => {
@@ -286,7 +328,6 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   newProject: async () => {
     const token = ++sessionToken;
-    uploadController?.abort();
     try {
       const project = await api.createProject(`未命名工程 ${Date.now() % 100000}`, []);
       if (token !== sessionToken) return;
@@ -309,7 +350,6 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   openProject: async (id) => {
     const token = ++sessionToken;
-    uploadController?.abort();
     set({ busy: true, message: "正在打开工程…" });
     try {
       const project = await api.getProject(id);
@@ -595,6 +635,66 @@ export const useEditor = create<EditorState>((set, get) => ({
 
 function mediaMap(media: MediaInfo[]): Record<string, MediaInfo> {
   return Object.fromEntries(media.map((item) => [item.id, item]));
+}
+
+type SetState = (partial: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void;
+
+function latestImport(get: () => EditorState, key: string): ImportTask | undefined {
+  return get().imports.find((task) => task.key === key);
+}
+
+function updateImport(set: SetState, key: string, patch: Partial<ImportTask>) {
+  set((state) => ({
+    imports: state.imports.map((task) => (task.key === key ? { ...task, ...patch } : task)),
+  }));
+}
+
+/**
+ * Run one import attempt for a single file. Each attempt is sequenced
+ * per task key: a late return (success, failure or abort) from an older
+ * attempt is dropped, so a cancelled-then-retried file or a slow retry
+ * can never overwrite the state of the newest attempt. Import results
+ * belong to the media library, not to whichever project is current, so
+ * creating/opening/clearing a project while reading never loses them.
+ */
+async function runImport(
+  key: string,
+  file: File,
+  get: () => EditorState,
+  set: SetState,
+) {
+  const attempt = (importAttempts.get(key) ?? 0) + 1;
+  importAttempts.set(key, attempt);
+  importControllers.get(key)?.abort();
+  const controller = new AbortController();
+  importControllers.set(key, controller);
+  const token = mediaToken;
+  const isCurrent = () =>
+    importAttempts.get(key) === attempt && importControllers.get(key) === controller;
+  updateImport(set, key, { status: "reading", detail: null });
+  try {
+    const info = await api.uploadMedia(file, controller.signal);
+    if (token !== mediaToken || !isCurrent()) return;
+    const existed = get().media.some((item) => item.id === info.id);
+    updateImport(set, key, {
+      status: "done",
+      mediaId: info.id,
+      detail: existed ? "素材已在库中，直接复用" : "导入完成",
+    });
+    await get().loadMedia();
+  } catch (error) {
+    if (token !== mediaToken || !isCurrent()) return;
+    if ((error as Error).name === "AbortError" || controller.signal.aborted) {
+      updateImport(set, key, { status: "cancelled", detail: "已取消，可单独重试" });
+    } else {
+      updateImport(set, key, {
+        status: "failed",
+        detail: (error as Error).message || "读取失败",
+      });
+    }
+  } finally {
+    if (importControllers.get(key) === controller) importControllers.delete(key);
+  }
 }
 
 function editRejected(set: (partial: Partial<EditorState>) => void, message: string) {
