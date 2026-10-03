@@ -8,6 +8,15 @@ export interface MediaInfo {
   is_sample: boolean;
 }
 
+export type UploadStatus = "reading" | "done" | "failed";
+
+export interface UploadEntry {
+  key: string;
+  name: string;
+  status: UploadStatus;
+  error: string | null;
+}
+
 export interface Clip {
   id: string;
   media_id: string;

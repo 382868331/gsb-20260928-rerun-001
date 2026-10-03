@@ -8,6 +8,7 @@ import type {
   Timeline,
   TimelineClip,
   TimelineSpeedSegment,
+  UploadEntry,
 } from "./types";
 
 function makeClipId(): string {
@@ -139,6 +140,7 @@ export function computeLocalTimeline(
 
 interface EditorState {
   media: MediaInfo[];
+  uploads: UploadEntry[];
   projects: Project[];
   project: Project | null;
   timeline: Timeline | null;
@@ -146,14 +148,14 @@ interface EditorState {
   exportJob: ExportInfo | null;
   message: string | null;
   busy: boolean;
-  uploadingName: string | null;
   canUndo: boolean;
   canRedo: boolean;
   lastEditLabel: string | null;
 
-  loadMedia: (sessionToken?: number) => Promise<void>;
-  uploadMedia: (file: File) => Promise<void>;
-  cancelUpload: () => void;
+  loadMedia: () => Promise<void>;
+  uploadMedia: (files: File[]) => void;
+  retryUpload: (key: string) => void;
+  cancelUpload: (key: string) => void;
   loadProjects: () => Promise<void>;
   newProject: () => Promise<void>;
   openProject: (id: string) => Promise<void>;
@@ -177,8 +179,37 @@ interface EditorState {
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+// Project-session token: guards results that belong to a specific
+// project (open/timeline/save/export). Bumped on new/open project so a
+// late response from a previous project can never write into the new one.
 let sessionToken = 0;
-let uploadController: AbortController | null = null;
+// Media-library token: the library is independent of any project, so it
+// has its own ordering guard. Only the newest media-list response may
+// replace the list; creating or switching projects never invalidates it.
+let mediaListToken = 0;
+
+interface UploadTask {
+  file: File;
+  attempt: number;
+  controller: AbortController;
+}
+
+// In-flight (or failed-but-retryable) uploads, keyed by upload entry key.
+// Kept outside the zustand state because File/AbortController are not
+// serializable; the UI-facing status lives in state.uploads.
+const uploadTasks = new Map<string, UploadTask>();
+
+function makeUploadKey(): string {
+  return `upload-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function upsertMediaItem(media: MediaInfo[], item: MediaInfo): MediaInfo[] {
+  const index = media.findIndex((entry) => entry.id === item.id);
+  if (index < 0) return [...media, item];
+  const next = [...media];
+  next[index] = item;
+  return next;
+}
 
 interface HistoryEntry {
   label: string;
@@ -226,6 +257,7 @@ function ensureHistory(project: Project): ProjectHistory {
 
 export const useEditor = create<EditorState>((set, get) => ({
   media: [],
+  uploads: [],
   projects: [],
   project: null,
   timeline: null,
@@ -233,49 +265,45 @@ export const useEditor = create<EditorState>((set, get) => ({
   exportJob: null,
   message: null,
   busy: false,
-  uploadingName: null,
   canUndo: false,
   canRedo: false,
   lastEditLabel: null,
 
   setMessage: (message) => set({ message }),
 
-  loadMedia: async (token = sessionToken) => {
+  loadMedia: async () => {
+    const token = ++mediaListToken;
     const media = await api.listMedia();
-    if (token !== sessionToken) return;
+    // Only the newest library request may replace the list. Project
+    // switches bump sessionToken, not mediaListToken, so a late media
+    // response is still applied to the library.
+    if (token !== mediaListToken) return;
     set({ media });
   },
 
-  uploadMedia: async (file) => {
-    uploadController?.abort();
-    const controller = new AbortController();
-    uploadController = controller;
-    const token = sessionToken;
-    set({ busy: true, uploadingName: file.name, message: `正在导入 ${file.name}…` });
-    try {
-      await api.uploadMedia(file, controller.signal);
-      if (token !== sessionToken || uploadController !== controller) return;
-      await get().loadMedia(token);
-      if (token !== sessionToken || uploadController !== controller) return;
-      set({ message: `已导入：${file.name}（原文件不会被修改），可加入时间线` });
-    } catch (error) {
-      if ((error as Error).name === "AbortError" || controller.signal.aborted) {
-        if (uploadController === controller) {
-          set({ message: `已取消导入：${file.name}，工程未改动` });
-        }
-        return;
-      }
-      set({ message: (error as Error).message });
-    } finally {
-      if (uploadController === controller) {
-        uploadController = null;
-        set({ busy: false, uploadingName: null });
-      }
-    }
+  uploadMedia: (files) => {
+    for (const file of files) startUpload(get, set, file);
   },
 
-  cancelUpload: () => {
-    uploadController?.abort();
+  retryUpload: (key) => {
+    const task = uploadTasks.get(key);
+    if (!task) {
+      set((state) => ({ uploads: state.uploads.filter((entry) => entry.key !== key) }));
+      return;
+    }
+    startUpload(get, set, task.file, key);
+  },
+
+  cancelUpload: (key) => {
+    const task = uploadTasks.get(key);
+    if (!task) return;
+    task.attempt += 1;
+    task.controller.abort();
+    uploadTasks.delete(key);
+    set((state) => ({
+      uploads: state.uploads.filter((entry) => entry.key !== key),
+      message: `已取消导入：${task.file.name}，工程未改动`,
+    }));
   },
 
   loadProjects: async () => {
@@ -286,7 +314,6 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   newProject: async () => {
     const token = ++sessionToken;
-    uploadController?.abort();
     try {
       const project = await api.createProject(`未命名工程 ${Date.now() % 100000}`, []);
       if (token !== sessionToken) return;
@@ -309,7 +336,6 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   openProject: async (id) => {
     const token = ++sessionToken;
-    uploadController?.abort();
     set({ busy: true, message: "正在打开工程…" });
     try {
       const project = await api.getProject(id);
@@ -597,6 +623,78 @@ function mediaMap(media: MediaInfo[]): Record<string, MediaInfo> {
   return Object.fromEntries(media.map((item) => [item.id, item]));
 }
 
+function setUploadEntry(
+  set: (partial: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void,
+  key: string,
+  patch: Partial<UploadEntry>,
+) {
+  set((state) => ({
+    uploads: state.uploads.map((entry) =>
+      entry.key === key ? { ...entry, ...patch } : entry,
+    ),
+  }));
+}
+
+/**
+ * One upload attempt. Uploads belong to the media-library lifecycle, not
+ * to any project: new/open/clear of a project never aborts them, and a
+ * successful result is merged into the library by media id, so a late
+ * retry can never overwrite entries added by newer requests. Each attempt
+ * carries a per-key counter so a stale retry response is dropped.
+ */
+function startUpload(
+  get: () => EditorState,
+  set: (partial: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void,
+  file: File,
+  existingKey?: string,
+) {
+  const key = existingKey ?? makeUploadKey();
+  const previous = uploadTasks.get(key);
+  const attempt = (previous?.attempt ?? 0) + 1;
+  const controller = new AbortController();
+  uploadTasks.set(key, { file, attempt, controller });
+  set((state) => ({
+    uploads: [
+      ...state.uploads.filter((entry) => entry.key !== key),
+      { key, name: file.name, status: "reading", error: null },
+    ],
+    message: `正在导入 ${file.name}…`,
+  }));
+  const isCurrent = () => uploadTasks.get(key)?.attempt === attempt;
+  void (async () => {
+    try {
+      const info = await api.uploadMedia(file, controller.signal);
+      if (!isCurrent()) return;
+      uploadTasks.delete(key);
+      set((state) => ({
+        media: upsertMediaItem(state.media, info),
+        message: `已导入：${file.name}（原文件不会被修改），可加入时间线`,
+      }));
+      setUploadEntry(set, key, { status: "done", error: null });
+      // Reconcile with the server index (ordering, dedup) in the
+      // background; guarded by mediaListToken so only the newest
+      // library response wins.
+      void get().loadMedia();
+    } catch (error) {
+      if (!isCurrent()) return;
+      if ((error as Error).name === "AbortError" || controller.signal.aborted) {
+        uploadTasks.delete(key);
+        set((state) => ({
+          uploads: state.uploads.filter((entry) => entry.key !== key),
+          message: `已取消导入：${file.name}，工程未改动`,
+        }));
+        return;
+      }
+      // Keep the File around so the entry can be retried on its own.
+      setUploadEntry(set, key, {
+        status: "failed",
+        error: (error as Error).message,
+      });
+      set({ message: `导入失败：${file.name}（${(error as Error).message}），可单独重试` });
+    }
+  })();
+}
+
 function editRejected(set: (partial: Partial<EditorState>) => void, message: string) {
   set({ message });
 }
@@ -672,4 +770,30 @@ function scheduleSave(set: (partial: Partial<EditorState>) => void, get: () => E
   saveTimer = setTimeout(() => {
     void get().save();
   }, 600);
+}
+
+/** Test hook: reset all module-level lifecycle guards and state. */
+export function __resetEditorForTests() {
+  sessionToken += 1;
+  mediaListToken += 1;
+  histories.clear();
+  uploadTasks.clear();
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  useEditor.setState({
+    media: [],
+    uploads: [],
+    projects: [],
+    project: null,
+    timeline: null,
+    selectedClipId: null,
+    exportJob: null,
+    message: null,
+    busy: false,
+    canUndo: false,
+    canRedo: false,
+    lastEditLabel: null,
+  });
 }

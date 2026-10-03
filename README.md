@@ -34,6 +34,7 @@ npm run dev   # http://127.0.0.1:5173 ，/api 代理到 8000
 ```bash
 .venv/bin/python -m pytest backend/tests -q
 .venv/bin/python backend/scripts/verify_export.py
+cd frontend && npm run test   # 素材库/工程生命周期交错的竞态回归（可控迟到返回）
 ```
 
 `verify_export.py` 会导出一条已知时间线（1.5s + 2.5s + 1.5s），然后：
