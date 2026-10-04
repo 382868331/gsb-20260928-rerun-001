@@ -1,7 +1,9 @@
 import type {
   Clip,
   ExportInfo,
+  ImportResult,
   MediaInfo,
+  PackageInfo,
   Project,
   Timeline,
 } from "./types";
@@ -66,5 +68,27 @@ export const api = {
     }),
   listExports: (id: string) =>
     request<ExportInfo[]>(`/api/projects/${id}/exports`),
+  startPackage: (projectId: string) =>
+    request<PackageInfo>(`/api/projects/${projectId}/packages`, { method: "POST" }),
+  getPackage: (jobId: string) => request<PackageInfo>(`/api/packages/${jobId}`),
+  cancelPackage: (jobId: string) =>
+    request<{ cancelled: boolean }>(`/api/packages/${jobId}/cancel`, { method: "POST" }),
+  packageDownloadUrl: (jobId: string) => `/api/packages/${jobId}/download`,
+  importProject: async (file: File): Promise<ImportResult> => {
+    const form = new FormData();
+    form.append("file", file);
+    const response = await fetch("/api/projects/import", {
+      method: "POST",
+      body: form,
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const detail = data.detail;
+      throw new Error(
+        typeof detail === "string" ? detail : "工程包导入失败",
+      );
+    }
+    return response.json();
+  },
   mediaStreamUrl: (mediaId: string) => `/api/media/${mediaId}/stream`,
 };

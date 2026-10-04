@@ -89,3 +89,33 @@ export interface ExportInfo {
   created_at: string;
   finished_at: string | null;
 }
+
+export type PackageStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface PackageInfo {
+  id: string;
+  project_id: string;
+  status: PackageStatus;
+  progress: number;
+  output_url: string | null;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface ImportReport {
+  reused: string[];
+  imported: string[];
+  missing: string[];
+  corrupt: string[];
+}
+
+export interface ImportResult {
+  project: Project;
+  report: ImportReport;
+}

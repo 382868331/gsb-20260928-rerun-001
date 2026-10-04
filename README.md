@@ -14,6 +14,8 @@ Python(FastAPI) + React(Vite) 的最小可用剪辑台。画面和声音共用**
 - 工程保存为 `data/projects/<id>.json`（原子写入），重新打开后继续剪，版本号递增
 - 后台 ffmpeg 导出 MP4：逐速度段 `trim/atrim` 同一 PTS 区间并同步 `setpts/asetpts`，再 concat/xfade 拼接；支持导出选定时间区间
 - 导出可中断（terminate 子进程，删除中间文件）；失败/取消不会破坏工程
+- 工程打包为单个 .gsbpack 文件（zip：project.json + manifest.json + 按 sha256 命名的素材），只打包实际引用的素材，相同内容只保存一份；打包在后台线程进行，可随时取消，取消不留残包
+- 离线恢复：在空素材库导入工程包后继续编辑；素材按内容哈希匹配复用，同名不同内容绝不误用；缺失/损坏的素材在导入时按名列出并整体拒绝，不产生半成品工程；恢复后片段顺序、裁切、变速与打包前一致，导出结果相同
 
 ## 运行
 
@@ -48,5 +50,6 @@ cd frontend && npm run test   # 素材库/工程生命周期交错的竞态回�
 - `backend/app/timeline.py`：唯一时间线计算（预览/导出共用）
 - `backend/app/store.py`：工程 JSON 原子保存
 - `backend/app/exporter.py`：ffmpeg 逐段裁切 + concat + 任务取消
+- `backend/app/packager.py`：工程包导出（可取消）与离线导入恢复（校验/去重/重映射）
 - `frontend/src/store.ts`：编辑状态与本地时间线镜像（以后端 `/timeline` 为准）
 - `frontend/src/components/Preview.tsx`：按时间线调度的统一预览

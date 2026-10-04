@@ -1,4 +1,6 @@
-import { FolderOpen, Save } from "lucide-react";
+import { useEffect, useRef } from "react";
+import { Download, Loader2, Package, PackageOpen, Save, XCircle } from "lucide-react";
+import { api } from "../api";
 import { useEditor } from "../store";
 
 export function ProjectBar() {
@@ -9,6 +11,21 @@ export function ProjectBar() {
   const newProject = useEditor((state) => state.newProject);
   const renameProject = useEditor((state) => state.renameProject);
   const busy = useEditor((state) => state.busy);
+  const packageJob = useEditor((state) => state.packageJob);
+  const startPackage = useEditor((state) => state.startPackage);
+  const pollPackage = useEditor((state) => state.pollPackage);
+  const cancelPackage = useEditor((state) => state.cancelPackage);
+  const importPackage = useEditor((state) => state.importPackage);
+  const fileInput = useRef<HTMLInputElement | null>(null);
+
+  const packing =
+    packageJob?.status === "running" || packageJob?.status === "pending";
+
+  useEffect(() => {
+    if (!packing) return;
+    const timer = setInterval(() => void pollPackage(), 500);
+    return () => clearInterval(timer);
+  }, [packing, pollPackage]);
 
   return (
     <header className="topbar">
@@ -41,8 +58,55 @@ export function ProjectBar() {
               <Save size={15} /> 保存
             </button>
             <span className="meta">v{project.version}</span>
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy || packing}
+              title="把工程和实际引用的素材打成一个可搬运文件"
+              onClick={() => void startPackage()}
+            >
+              {packing ? <Loader2 className="spin" size={15} /> : <Package size={15} />}
+              导出工程包
+            </button>
+            {packing && (
+              <button type="button" className="danger" onClick={() => void cancelPackage()}>
+                <XCircle size={15} /> 取消打包
+              </button>
+            )}
+            {packageJob?.status === "done" && packageJob.output_url && (
+              <a
+                className="download-link"
+                href={api.packageDownloadUrl(packageJob.id)}
+                download
+              >
+                <Download size={15} /> 下载工程包
+              </a>
+            )}
+            {packageJob?.status === "failed" && (
+              <span className="meta">打包失败：{packageJob.error}</span>
+            )}
           </>
         )}
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy}
+          title="从工程包恢复工程及其素材到当前素材库"
+          onClick={() => fileInput.current?.click()}
+        >
+          <PackageOpen size={15} /> 导入工程包
+        </button>
+        <input
+          ref={fileInput}
+          type="file"
+          accept=".gsbpack,.zip,application/zip"
+          style={{ display: "none" }}
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            if (file) void importPackage(file);
+          }}
+        />
       </div>
     </header>
   );

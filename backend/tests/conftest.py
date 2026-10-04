@@ -20,6 +20,7 @@ from app import samples as samples_module  # noqa: E402
 from app.models import ExportPayload, ProjectPayload  # noqa: E402
 from app import store as store_module  # noqa: E402
 from app import exporter as exporter_module  # noqa: E402
+from app import packager as packager_module  # noqa: E402
 from app.config import ensure_dirs  # noqa: E402
 from app.samples import ensure_samples  # noqa: E402
 
@@ -86,6 +87,12 @@ class DirectClient:
         m = re.fullmatch(r"/api/projects/([^/]+)", path)
         if m:
             return self._call(api_module.get_project, project_id=m.group(1))
+        m = re.fullmatch(r"/api/packages/([^/]+)/download", path)
+        if m:
+            return self._call(api_module.download_package, job_id=m.group(1))
+        m = re.fullmatch(r"/api/packages/([^/]+)", path)
+        if m:
+            return self._call(api_module.get_package, job_id=m.group(1))
         m = re.fullmatch(r"/api/exports/([^/]+)", path)
         if m:
             return self._call(api_module.get_export, job_id=m.group(1))
@@ -115,6 +122,21 @@ class DirectClient:
         m = re.fullmatch(r"/api/exports/([^/]+)/cancel", path)
         if m:
             return self._call(api_module.cancel_export, job_id=m.group(1))
+        m = re.fullmatch(r"/api/projects/([^/]+)/packages", path)
+        if m:
+            return self._call(api_module.start_package, project_id=m.group(1))
+        m = re.fullmatch(r"/api/packages/([^/]+)/cancel", path)
+        if m:
+            return self._call(api_module.cancel_package, job_id=m.group(1))
+        if path == "/api/projects/import" and files:
+            file_tuple = files["file"]
+            filename, data = file_tuple[0], file_tuple[1]
+            upload = UploadFile(filename=filename, file=io.BytesIO(data))
+            try:
+                result = api_module.import_project(file=upload)
+            except HTTPException as exc:
+                raise HTTPError(exc.status_code, exc.detail)
+            return Response(result)
         raise AssertionError(f"unknown POST {path}")
 
     async def _upload_async(self, upload):
@@ -146,6 +168,7 @@ def client(tmp_path, monkeypatch):
         "PROJECTS_DIR": data_root / "projects",
         "EXPORTS_DIR": data_root / "exports",
         "SAMPLES_DIR": data_root / "samples",
+        "PACKAGES_DIR": data_root / "packages",
     }
     monkeypatch.setattr(config, "DATA_ROOT", data_root)
     for name, target in dirs.items():
@@ -159,6 +182,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(store_module, "MEDIA_DIR", dirs["MEDIA_DIR"])
     monkeypatch.setattr(store_module, "PROJECTS_DIR", dirs["PROJECTS_DIR"])
     monkeypatch.setattr(exporter_module, "EXPORTS_DIR", dirs["EXPORTS_DIR"])
+    monkeypatch.setattr(packager_module, "PACKAGES_DIR", dirs["PACKAGES_DIR"])
+    monkeypatch.setattr(packager_module, "STAGING_DIR", data_root / "staging")
     config.ensure_dirs()
     samples = ensure_samples()
     yield DirectClient(), samples, config

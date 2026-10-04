@@ -3,7 +3,9 @@ import { api } from "./api";
 import type {
   Clip,
   ExportInfo,
+  ImportResult,
   MediaInfo,
+  PackageInfo,
   Project,
   Timeline,
   TimelineClip,
@@ -146,6 +148,7 @@ interface EditorState {
   timeline: Timeline | null;
   selectedClipId: string | null;
   exportJob: ExportInfo | null;
+  packageJob: PackageInfo | null;
   message: string | null;
   busy: boolean;
   canUndo: boolean;
@@ -175,6 +178,10 @@ interface EditorState {
   startExport: (range?: { start: number; end: number }) => Promise<void>;
   pollExport: () => Promise<void>;
   cancelExport: () => Promise<void>;
+  startPackage: () => Promise<void>;
+  pollPackage: () => Promise<void>;
+  cancelPackage: () => Promise<void>;
+  importPackage: (file: File) => Promise<void>;
   setMessage: (message: string | null) => void;
 }
 
@@ -263,6 +270,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   timeline: null,
   selectedClipId: null,
   exportJob: null,
+  packageJob: null,
   message: null,
   busy: false,
   canUndo: false,
@@ -616,6 +624,64 @@ export const useEditor = create<EditorState>((set, get) => ({
     if (!exportJob) return;
     await api.cancelExport(exportJob.id);
     await get().pollExport();
+  },
+
+  startPackage: async () => {
+    const token = sessionToken;
+    const { project } = get();
+    if (!project) return;
+    await get().save();
+    if (token !== sessionToken || get().project?.id !== project.id) return;
+    try {
+      const job = await api.startPackage(project.id);
+      if (token !== sessionToken || get().project?.id !== project.id) return;
+      set({ packageJob: job, message: "工程打包已开始…" });
+    } catch (error) {
+      if (token === sessionToken)
+        set({ message: `打包失败：${(error as Error).message}` });
+    }
+  },
+
+  pollPackage: async () => {
+    const { packageJob } = get();
+    if (!packageJob) return;
+    const job = await api.getPackage(packageJob.id);
+    set({ packageJob: job });
+    if (job.status === "done")
+      set({
+        message: "工程包已生成，可下载搬运；包含工程与全部引用素材（相同内容只存一份）",
+      });
+    if (job.status === "failed") set({ message: `打包失败：${job.error}` });
+    if (job.status === "cancelled")
+      set({ message: "打包已取消，未生成工程包，工程未受影响" });
+  },
+
+  cancelPackage: async () => {
+    const { packageJob } = get();
+    if (!packageJob) return;
+    await api.cancelPackage(packageJob.id);
+    await get().pollPackage();
+  },
+
+  importPackage: async (file) => {
+    set({ busy: true, message: `正在导入工程包 ${file.name}…` });
+    try {
+      const result: ImportResult = await api.importProject(file);
+      const { report } = result;
+      await get().loadMedia();
+      await get().loadProjects();
+      await get().openProject(result.project.id);
+      const parts = [`导入完成：${result.project.name}`];
+      if (report.imported.length)
+        parts.push(`新导入素材 ${report.imported.length} 个`);
+      if (report.reused.length)
+        parts.push(`复用已有素材 ${report.reused.length} 个`);
+      set({ message: parts.join("，") });
+    } catch (error) {
+      set({ message: `工程包导入失败：${(error as Error).message}` });
+    } finally {
+      set({ busy: false });
+    }
   },
 }));
 

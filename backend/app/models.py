@@ -112,6 +112,29 @@ class Timeline(BaseModel):
     missing_media_ids: list[str]
 
 
+class PackageInfo(BaseModel):
+    id: str
+    project_id: str
+    status: Literal["pending", "running", "done", "failed", "cancelled"]
+    progress: float = 0.0
+    output_url: str | None = None
+    error: str | None = None
+    created_at: str
+    finished_at: str | None = None
+
+
+class ImportReport(BaseModel):
+    reused: list[str] = Field(default_factory=list)
+    imported: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    corrupt: list[str] = Field(default_factory=list)
+
+
+class ImportResult(BaseModel):
+    project: Project
+    report: ImportReport
+
+
 class ExportInfo(BaseModel):
     id: str
     project_id: str
