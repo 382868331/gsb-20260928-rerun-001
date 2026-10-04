@@ -3,7 +3,9 @@ import { api } from "./api";
 import type {
   Clip,
   ExportInfo,
+  ImportResult,
   MediaInfo,
+  PackageInfo,
   Project,
   Timeline,
   TimelineClip,
@@ -146,6 +148,7 @@ interface EditorState {
   timeline: Timeline | null;
   selectedClipId: string | null;
   exportJob: ExportInfo | null;
+  packageJob: PackageInfo | null;
   message: string | null;
   busy: boolean;
   canUndo: boolean;
@@ -175,6 +178,10 @@ interface EditorState {
   startExport: (range?: { start: number; end: number }) => Promise<void>;
   pollExport: () => Promise<void>;
   cancelExport: () => Promise<void>;
+  startPackage: () => Promise<void>;
+  pollPackage: () => Promise<void>;
+  cancelPackage: () => Promise<void>;
+  importPackage: (file: File) => Promise<boolean>;
   setMessage: (message: string | null) => void;
 }
 
@@ -263,6 +270,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   timeline: null,
   selectedClipId: null,
   exportJob: null,
+  packageJob: null,
   message: null,
   busy: false,
   canUndo: false,
@@ -323,6 +331,7 @@ export const useEditor = create<EditorState>((set, get) => ({
         timeline: { duration: 0, clips: [], missing_media_ids: [] },
         selectedClipId: null,
         exportJob: null,
+        packageJob: null,
         canUndo: false,
         canRedo: false,
         lastEditLabel: null,
@@ -348,6 +357,7 @@ export const useEditor = create<EditorState>((set, get) => ({
         timeline,
         selectedClipId: sanitizeSelection(project.clips, history.present.selectedClipId),
         exportJob: null,
+        packageJob: null,
         canUndo: history.past.length > 0,
         canRedo: history.future.length > 0,
         lastEditLabel: null,
@@ -617,6 +627,64 @@ export const useEditor = create<EditorState>((set, get) => ({
     await api.cancelExport(exportJob.id);
     await get().pollExport();
   },
+
+  startPackage: async () => {
+    const { project } = get();
+    if (!project) return;
+    await get().save();
+    if (get().project?.id !== project.id) return;
+    const job = await api.startPackage(project.id);
+    set({ packageJob: job, message: "正在打包工程与引用素材…" });
+  },
+
+  pollPackage: async () => {
+    const token = sessionToken;
+    const { packageJob } = get();
+    if (!packageJob) return;
+    const job = await api.getPackage(packageJob.id);
+    if (token !== sessionToken) return;
+    set({ packageJob: job });
+    if (job.status === "done") set({ message: "工程包已生成，可下载后搬运到其他素材库" });
+    if (job.status === "failed") set({ message: `打包失败：${job.error}` });
+    if (job.status === "cancelled")
+      set({ message: "打包已取消，工程与素材未受影响，可重新打包" });
+  },
+
+  cancelPackage: async () => {
+    const { packageJob } = get();
+    if (!packageJob) return;
+    await api.cancelPackage(packageJob.id);
+    await get().pollPackage();
+  },
+
+  importPackage: async (file) => {
+    let result: ImportResult | undefined;
+    try {
+      result = await api.importPackage(file);
+    } catch (error) {
+      const failed = error as Error & { result?: ImportResult };
+      if (failed.result) {
+        const issues = failed.result.issues
+          .map((issue) => issue.detail)
+          .join("；");
+        set({
+          message: `导入失败，未修改素材库/工程：${issues || failed.result.error || failed.message}`,
+        });
+      } else {
+        set({ message: `导入失败：${failed.message}` });
+      }
+      return false;
+    }
+    set({
+      message:
+        `已从工程包恢复工程「${result.project_name}」：导入 ${result.imported_media.length} 个素材，` +
+        `复用 ${result.reused_media.length} 个相同素材，片段顺序、裁切与变速保持一致`,
+    });
+    await get().loadMedia();
+    await get().loadProjects();
+    if (result.project_id) await get().openProject(result.project_id);
+    return true;
+  },
 }));
 
 function mediaMap(media: MediaInfo[]): Record<string, MediaInfo> {
@@ -790,6 +858,7 @@ export function __resetEditorForTests() {
     timeline: null,
     selectedClipId: null,
     exportJob: null,
+    packageJob: null,
     message: null,
     busy: false,
     canUndo: false,

@@ -1,7 +1,9 @@
 import type {
   Clip,
   ExportInfo,
+  ImportResult,
   MediaInfo,
+  PackageInfo,
   Project,
   Timeline,
 } from "./types";
@@ -67,4 +69,36 @@ export const api = {
   listExports: (id: string) =>
     request<ExportInfo[]>(`/api/projects/${id}/exports`),
   mediaStreamUrl: (mediaId: string) => `/api/media/${mediaId}/stream`,
+  startPackage: (id: string) =>
+    request<PackageInfo>(`/api/projects/${id}/packages`, { method: "POST" }),
+  getPackage: (id: string) => request<PackageInfo>(`/api/packages/${id}`),
+  cancelPackage: (id: string) =>
+    request<{ cancelled: boolean }>(`/api/packages/${id}/cancel`, {
+      method: "POST",
+    }),
+  packageDownloadUrl: (id: string) => `/api/packages/${id}/download`,
+  importPackage: async (file: File, signal?: AbortSignal): Promise<ImportResult> => {
+    const form = new FormData();
+    form.append("file", file);
+    const response = await fetch("/api/packages/import", {
+      method: "POST",
+      body: form,
+      signal,
+    });
+    const data = (await response.json().catch(() => null)) as
+      | ImportResult
+      | { detail: ImportResult }
+      | null;
+    if (!response.ok) {
+      const result =
+        data && "detail" in data ? (data.detail as ImportResult) : undefined;
+      const error = new Error(
+        result?.error ?? "工程包导入失败",
+      ) as Error & { result?: ImportResult };
+      error.result = result;
+      throw error;
+    }
+    if (!data || "detail" in data) throw new Error("工程包导入失败");
+    return data;
+  },
 };

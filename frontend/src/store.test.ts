@@ -14,6 +14,10 @@ vi.mock("./api", () => ({
     getExport: vi.fn(),
     cancelExport: vi.fn(),
     listExports: vi.fn(),
+    startPackage: vi.fn(),
+    getPackage: vi.fn(),
+    cancelPackage: vi.fn(),
+    importPackage: vi.fn(),
     mediaStreamUrl: (id: string) => `/api/media/${id}/stream`,
   },
 }));
@@ -353,5 +357,112 @@ describe("工程编辑状态隔离", () => {
     useEditor.getState().undo();
     state = useEditor.getState();
     expect(state.project?.clips.map((clip) => clip.id)).toEqual([clipId]);
+  });
+});
+
+import type { ImportResult, PackageInfo } from "./types";
+
+describe("工程打包与离线恢复", () => {
+  it("打包完成后可下载；导入失败的缺失/损坏清单不改状态，成功后打开恢复工程", async () => {
+    const project = makeProject("pkg", [makeClip("clip-1", "m1"), makeClip("clip-2", "m1")]);
+    serverProjects.set(project.id, project);
+    mockApi.saveProject.mockImplementation(
+      (id: string, name: string, clips: Project["clips"]) => {
+        const saved = { ...project, name, clips: structuredClone(clips), version: 2 };
+        serverProjects.set(id, saved);
+        return Promise.resolve(saved);
+      },
+    );
+    await useEditor.getState().openProject("pkg");
+
+    const packageInfo: PackageInfo = {
+      id: "job1",
+      project_id: "pkg",
+      status: "pending",
+      progress: 0,
+      output_url: null,
+      error: null,
+      created_at: "2026-10-05T00:00:00+00:00",
+      finished_at: null,
+    };
+    mockApi.startPackage.mockResolvedValue(packageInfo);
+    mockApi.getPackage
+      .mockResolvedValueOnce({ ...packageInfo, status: "running", progress: 0.5 })
+      .mockResolvedValueOnce({
+        ...packageInfo,
+        status: "done",
+        progress: 1,
+        output_url: "/api/packages/job1/download",
+        finished_at: "2026-10-05T00:01:00+00:00",
+      });
+
+    await useEditor.getState().startPackage();
+    expect(mockApi.startPackage).toHaveBeenCalledWith("pkg");
+    expect(useEditor.getState().packageJob?.status).toBe("pending");
+    await useEditor.getState().pollPackage();
+    await useEditor.getState().pollPackage();
+    expect(useEditor.getState().packageJob?.output_url).toBe(
+      "/api/packages/job1/download",
+    );
+
+    // Failed import with explicit corrupt/missing issues: message lists
+    // them and current project/media stay untouched.
+    const failedResult: ImportResult = {
+      ok: false,
+      project_id: null,
+      project_name: null,
+      imported_media: [],
+      reused_media: [],
+      issues: [
+        {
+          kind: "corrupt",
+          media_id: "m1",
+          filename: "a.mp4",
+          sha256: "abc",
+          detail: "素材文件已损坏（校验不匹配）：a.mp4",
+        },
+      ],
+      error: "工程包校验未通过",
+    };
+    mockApi.importPackage.mockRejectedValueOnce(
+      Object.assign(new Error(failedResult.error ?? "import failed"), {
+        result: failedResult,
+      }),
+    );
+    const okFail = await useEditor.getState().importPackage(new File(["x"], "bad.zip"));
+    expect(okFail).toBe(false);
+    expect(useEditor.getState().message).toContain("校验不匹配");
+    expect(useEditor.getState().project?.id).toBe("pkg");
+
+    // Successful restore: library reloads and the restored project opens.
+    const restoredMedia = makeMedia("new1", "a.mp4");
+    const restoredProject = makeProject("restored", [
+      makeClip("clip-1", "new1"),
+      makeClip("clip-2", "new1"),
+    ]);
+    restoredProject.name = "恢复工程";
+    mockApi.importPackage.mockResolvedValueOnce({
+      ok: true,
+      project_id: "restored",
+      project_name: "恢复工程",
+      imported_media: [restoredMedia],
+      reused_media: [],
+      issues: [],
+      error: null,
+    });
+    mockApi.listMedia.mockResolvedValueOnce([restoredMedia]);
+    mockApi.listProjects.mockResolvedValueOnce([restoredProject]);
+    mockApi.getProject.mockResolvedValueOnce(restoredProject);
+
+    const ok = await useEditor.getState().importPackage(new File(["x"], "good.zip"));
+    expect(ok).toBe(true);
+    await flush();
+    expect(useEditor.getState().project?.id).toBe("restored");
+    expect(useEditor.getState().media.map((item) => item.id)).toEqual(["new1"]);
+    // Clip order and trim values survive the restore.
+    expect(useEditor.getState().project?.clips.map((clip) => clip.id)).toEqual([
+      "clip-1",
+      "clip-2",
+    ]);
   });
 });

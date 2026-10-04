@@ -6,6 +6,7 @@ export interface MediaInfo {
   height: number | null;
   has_audio: boolean;
   is_sample: boolean;
+  sha256?: string | null;
 }
 
 export type UploadStatus = "reading" | "done" | "failed";
@@ -88,4 +89,40 @@ export interface ExportInfo {
   error: string | null;
   created_at: string;
   finished_at: string | null;
+}
+
+export type PackageStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface PackageInfo {
+  id: string;
+  project_id: string;
+  status: PackageStatus;
+  progress: number;
+  output_url: string | null;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface ImportIssue {
+  kind: "missing" | "corrupt";
+  media_id: string | null;
+  filename: string | null;
+  sha256: string | null;
+  detail: string;
+}
+
+export interface ImportResult {
+  ok: boolean;
+  project_id: string | null;
+  project_name: string | null;
+  imported_media: MediaInfo[];
+  reused_media: MediaInfo[];
+  issues: ImportIssue[];
+  error: string | null;
 }

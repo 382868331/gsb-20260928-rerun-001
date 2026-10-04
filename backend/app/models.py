@@ -121,3 +121,44 @@ class ExportInfo(BaseModel):
     error: str | None = None
     created_at: str
     finished_at: str | None = None
+
+
+class PackageInfo(BaseModel):
+    id: str
+    project_id: str
+    status: Literal["pending", "running", "done", "failed", "cancelled"]
+    progress: float = 0.0
+    output_url: str | None = None
+    error: str | None = None
+    created_at: str
+    finished_at: str | None = None
+
+
+class PackageMediaEntry(BaseModel):
+    # Media id used by the project's clips.
+    media_id: str
+    filename: str
+    duration: float
+    width: int | None = None
+    height: int | None = None
+    has_audio: bool
+    is_sample: bool = False
+    sha256: str
+
+
+class ImportIssue(BaseModel):
+    kind: Literal["missing", "corrupt"]
+    media_id: str | None = None
+    filename: str | None = None
+    sha256: str | None = None
+    detail: str
+
+
+class ImportResult(BaseModel):
+    ok: bool
+    project_id: str | None = None
+    project_name: str | None = None
+    imported_media: list[MediaInfo] = Field(default_factory=list)
+    reused_media: list[MediaInfo] = Field(default_factory=list)
+    issues: list[ImportIssue] = Field(default_factory=list)
+    error: str | None = None

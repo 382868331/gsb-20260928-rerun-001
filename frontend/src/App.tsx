@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { ArchivePanel } from "./components/ArchivePanel";
 import { ExportPanel } from "./components/ExportPanel";
 import { MediaLibrary } from "./components/MediaLibrary";
 import { Preview } from "./components/Preview";
@@ -37,6 +38,7 @@ export default function App() {
       <main className="workspace">
         <aside className="sidebar">
           <MediaLibrary />
+          <ArchivePanel />
           <ExportPanel />
         </aside>
         <section className="main-area">

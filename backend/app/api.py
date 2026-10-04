@@ -16,6 +16,7 @@ from . import media as media_service
 from .config import MEDIA_DIR, STAGING_DIR, ensure_dirs
 from .exporter import manager as export_manager
 from .models import ExportPayload, Project, ProjectPayload
+from .package import import_package, manager as package_manager
 from .samples import ensure_samples
 from .store import list_projects, load_project, media_path, save_project
 from .timeline import compute_timeline
@@ -172,3 +173,64 @@ def download_export(job_id: str):
     return FileResponse(
         path, media_type="video/mp4", filename=f"export-{job_id[:8]}.mp4"
     )
+
+
+# ---------------------------------------------------------------------------
+# Portable project packaging / offline recovery
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/projects/{project_id}/packages")
+def start_package(project_id: str) -> dict:
+    if load_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="工程不存在")
+    return package_manager.create(project_id).model_dump()
+
+
+@app.get("/api/projects/{project_id}/packages")
+def list_packages(project_id: str) -> list[dict]:
+    return [item.model_dump() for item in package_manager.list_for_project(project_id)]
+
+
+@app.get("/api/packages/{job_id}")
+def get_package(job_id: str) -> dict:
+    info = package_manager.get(job_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail="打包任务不存在")
+    return info.model_dump()
+
+
+@app.post("/api/packages/{job_id}/cancel")
+def cancel_package(job_id: str) -> dict:
+    if not package_manager.cancel(job_id):
+        raise HTTPException(status_code=404, detail="打包任务不存在")
+    return {"cancelled": True}
+
+
+@app.get("/api/packages/{job_id}/download")
+def download_package(job_id: str):
+    path = package_manager.output_path(job_id)
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="工程包不存在或尚未完成")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"project-{job_id[:8]}.zip",
+    )
+
+
+@app.post("/api/packages/import")
+def import_project_package(file: UploadFile = File(...)) -> dict:
+    ensure_dirs()
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    staging = STAGING_DIR / f"package_{uuid.uuid4().hex}.zip"
+    try:
+        staging.write_bytes(file.file.read())
+        result = import_package(staging, file.filename or staging.name)
+    finally:
+        if staging.exists():
+            staging.unlink(missing_ok=True)
+    if not result.ok:
+        # 422 keeps the structured issue list available to the caller.
+        raise HTTPException(status_code=422, detail=result.model_dump())
+    return result.model_dump()
