@@ -11,6 +11,8 @@ vi.mock("./api", () => ({
     saveProject: vi.fn(),
     timeline: vi.fn(),
     startExport: vi.fn(),
+  previewReplacement: vi.fn(),
+  applyReplacement: vi.fn(),
     getExport: vi.fn(),
     cancelExport: vi.fn(),
     listExports: vi.fn(),
@@ -19,7 +21,7 @@ vi.mock("./api", () => ({
 }));
 
 import { api } from "./api";
-import { __resetEditorForTests, useEditor } from "./store";
+import { __resetEditorForTests, computeLocalTimeline, useEditor } from "./store";
 
 type MockedApi = {
   [K in keyof typeof api]: ReturnType<typeof vi.fn>;
@@ -49,6 +51,7 @@ function makeMedia(id: string, filename = `${id}.mp4`): MediaInfo {
     duration: 3,
     width: 320,
     height: 180,
+    fps: 30,
     has_audio: true,
     is_sample: false,
   };
@@ -353,5 +356,249 @@ describe("工程编辑状态隔离", () => {
     useEditor.getState().undo();
     state = useEditor.getState();
     expect(state.project?.clips.map((clip) => clip.id)).toEqual([clipId]);
+  });
+});
+
+describe("素材替换（缺失素材指定替代文件）", () => {
+  function setupProject() {
+    // clip-a and clip-b share m1 at different speeds; clip-c uses m2.
+    const project = makeProject("p-repl", [
+      {
+        ...makeClip("clip-a", "m1"),
+        source_in: 0,
+        source_out: 3,
+        speed_segments: [{ source_start: 1, source_end: 2, rate: 2 }],
+      },
+      {
+        ...makeClip("clip-b", "m1"),
+        source_in: 1,
+        source_out: 4,
+        speed_segments: [{ source_start: 2, source_end: 3, rate: 0.5 }],
+      },
+      makeClip("clip-c", "m2"),
+    ]);
+    serverProjects.set(project.id, project);
+    serverMedia.push(makeMedia("m2")); // m1 is missing from the library
+    return project;
+  }
+
+  function makePlan(overrides: Partial<import("./types").ReplacementPlan> = {}) {
+    return {
+      media_id: "m1",
+      replacement_media_id: "r1",
+      mode: "keep_source" as const,
+      identical_to_original: false,
+      original: null,
+      replacement: {
+        id: "r1",
+        filename: "替代.mp4",
+        duration: 4,
+        fps: 24,
+        has_audio: true,
+      },
+      clips: [
+        {
+          clip_id: "clip-a",
+          selected: true,
+          blocked: false,
+          reasons: [],
+          source_in: 0,
+          source_out: 3,
+          speed_segments: [{ source_start: 1, source_end: 2, rate: 2 }],
+          rendered_before: 2.5,
+          rendered_after: 2.5,
+        },
+        {
+          clip_id: "clip-b",
+          selected: true,
+          blocked: false,
+          reasons: [],
+          source_in: 1,
+          source_out: 4,
+          speed_segments: [{ source_start: 2, source_end: 3, rate: 0.5 }],
+          rendered_before: 4,
+          rendered_after: 4,
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  function mockApply() {
+    mockApi.applyReplacement.mockImplementation(
+      (id: string, body: { replacement_media_id: string; clip_ids?: string[] }) => {
+        const project = serverProjects.get(id)!;
+        const clips = project.clips.map((clip) =>
+          body.clip_ids?.includes(clip.id)
+            ? { ...clip, media_id: body.replacement_media_id }
+            : clip,
+        );
+        const updated = { ...project, clips, version: project.version + 1 };
+        serverProjects.set(id, updated);
+        const mediaMap = Object.fromEntries(
+          [...serverMedia, makeMedia("r1", "替代.mp4")].map((item) => [item.id, item]),
+        );
+        return Promise.resolve({
+          project: updated,
+          timeline: computeLocalTimeline(clips, mediaMap),
+        });
+      },
+    );
+  }
+
+  async function openAndPrepare(plan = makePlan()) {
+    mockApi.timeline.mockResolvedValue(emptyTimeline());
+    mockApi.uploadMedia.mockImplementation(() => {
+      const replacement = makeMedia("r1", "替代.mp4");
+      serverMedia.push(replacement);
+      return Promise.resolve(replacement);
+    });
+    mockApi.previewReplacement.mockResolvedValue(plan);
+    await useEditor.getState().openProject("p-repl");
+    await useEditor.getState().prepareReplacement("m1", makeFile("替代.mp4"));
+    expect(useEditor.getState().replacement?.plan).toEqual(plan);
+  }
+
+  it("部分替换只影响选定片段，撤销后画面顺序与音画同步恢复", async () => {
+    setupProject();
+    mockApply();
+    await openAndPrepare();
+
+    // Confirm only clip-a; clip-b keeps the old (missing) reference.
+    await useEditor.getState().confirmReplacement(["clip-a"]);
+    const after = useEditor.getState();
+    expect(after.project?.clips.map((clip) => clip.media_id)).toEqual([
+      "r1",
+      "m1",
+      "m2",
+    ]);
+    expect(after.project?.clips.map((clip) => clip.id)).toEqual([
+      "clip-a",
+      "clip-b",
+      "clip-c",
+    ]);
+    // Timeline from the server apply: positions and durations intact,
+    // so picture order and A/V sync are preserved.
+    expect(after.timeline?.clips.map((clip) => clip.start)).toEqual([0, 2.5, 6.5]);
+    expect(after.timeline?.clips.map((clip) => clip.duration)).toEqual([2.5, 4, 2]);
+    expect(after.timeline?.clips[1].media_missing).toBe(true);
+    expect(after.timeline?.missing_media_ids).toEqual(["m1"]);
+    expect(after.canUndo).toBe(true);
+
+    // Undo restores the original media references and timeline.
+    useEditor.getState().undo();
+    const restored = useEditor.getState();
+    expect(restored.project?.clips.map((clip) => clip.media_id)).toEqual([
+      "m1",
+      "m1",
+      "m2",
+    ]);
+    expect(restored.project?.clips.map((clip) => clip.id)).toEqual([
+      "clip-a",
+      "clip-b",
+      "clip-c",
+    ]);
+    expect(restored.timeline?.clips.map((clip) => clip.start)).toEqual([0, 2.5, 6.5]);
+    expect(restored.timeline?.clips.map((clip) => clip.duration)).toEqual([2.5, 4, 2]);
+    expect(restored.timeline?.missing_media_ids).toEqual(["m1"]);
+    expect(restored.canRedo).toBe(true);
+
+    // Redo re-applies the replacement exactly.
+    useEditor.getState().redo();
+    expect(useEditor.getState().project?.clips.map((clip) => clip.media_id)).toEqual([
+      "r1",
+      "m1",
+      "m2",
+    ]);
+  });
+
+  it("全部替换两个不同速度的共享片段，时间线总时长不变", async () => {
+    setupProject();
+    mockApply();
+    await openAndPrepare();
+
+    await useEditor.getState().confirmReplacement(["clip-a", "clip-b"]);
+    const state = useEditor.getState();
+    expect(state.project?.clips.map((clip) => clip.media_id)).toEqual([
+      "r1",
+      "r1",
+      "m2",
+    ]);
+    expect(state.timeline?.duration).toBe(8.5);
+    expect(state.timeline?.missing_media_ids).toEqual([]);
+  });
+
+  it("阻止片段不可确认，其他片段仍可继续", async () => {
+    setupProject();
+    const plan = makePlan({
+      clips: [
+        { ...makePlan().clips[0], blocked: true, reasons: ["替代素材时长不足（需要 3.00s，仅 2.00s）"] },
+        makePlan().clips[1],
+      ],
+    });
+    mockApply();
+    await openAndPrepare(plan);
+
+    // Blocked clip cannot be confirmed; the edit is rejected.
+    await useEditor.getState().confirmReplacement(["clip-a", "clip-b"]);
+    let state = useEditor.getState();
+    expect(state.message).toContain("无法替换");
+    expect(state.project?.clips.map((clip) => clip.media_id)).toEqual([
+      "m1",
+      "m1",
+      "m2",
+    ]);
+    expect(state.replacement).not.toBeNull();
+
+    // The independent (unblocked) clip can still be confirmed alone.
+    await useEditor.getState().confirmReplacement(["clip-b"]);
+    state = useEditor.getState();
+    expect(state.project?.clips.map((clip) => clip.media_id)).toEqual([
+      "m1",
+      "r1",
+      "m2",
+    ]);
+    expect(state.replacement).toBeNull();
+
+    // Undo restores the blocked clip's original reference too.
+    useEditor.getState().undo();
+    expect(useEditor.getState().project?.clips.map((clip) => clip.media_id)).toEqual([
+      "m1",
+      "m1",
+      "m2",
+    ]);
+  });
+
+  it("切换保持成片时长模式会重新预览并保留片段时长", async () => {
+    setupProject();
+    await openAndPrepare();
+
+    const scaled = makePlan({
+      mode: "keep_duration",
+      clips: [
+        {
+          ...makePlan().clips[0],
+          source_out: 1.5,
+          speed_segments: [
+            { source_start: 0, source_end: 0.5, rate: 0.5 },
+            { source_start: 0.5, source_end: 1, rate: 1 },
+            { source_start: 1, source_end: 1.5, rate: 0.5 },
+          ],
+          rendered_after: 2.5,
+        },
+        {
+          ...makePlan().clips[1],
+          source_in: 0.5,
+          source_out: 2,
+          rendered_after: 4,
+        },
+      ],
+    });
+    mockApi.previewReplacement.mockResolvedValue(scaled);
+    await useEditor.getState().setReplacementMode("keep_duration");
+    const plan = useEditor.getState().replacement?.plan;
+    expect(plan?.mode).toBe("keep_duration");
+    expect(plan?.clips[0].rendered_after).toBe(plan?.clips[0].rendered_before);
+    expect(plan?.clips[1].rendered_after).toBe(plan?.clips[1].rendered_before);
   });
 });

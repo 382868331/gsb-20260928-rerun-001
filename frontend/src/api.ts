@@ -1,5 +1,8 @@
 import type {
   Clip,
+  ReplacementApplyResult,
+  ReplacementMode,
+  ReplacementPlan,
   ExportInfo,
   ImportResult,
   MediaInfo,
@@ -91,4 +94,30 @@ export const api = {
     return response.json();
   },
   mediaStreamUrl: (mediaId: string) => `/api/media/${mediaId}/stream`,
+  previewReplacement: (
+    projectId: string,
+    body: {
+      media_id: string;
+      replacement_media_id: string;
+      mode: ReplacementMode;
+      clip_ids?: string[];
+    },
+  ) =>
+    request<ReplacementPlan>(`/api/projects/${projectId}/replacements/preview`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  applyReplacement: (
+    projectId: string,
+    body: {
+      media_id: string;
+      replacement_media_id: string;
+      mode: ReplacementMode;
+      clip_ids?: string[];
+    },
+  ) =>
+    request<ReplacementApplyResult>(`/api/projects/${projectId}/replacements/apply`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };

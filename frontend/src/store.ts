@@ -3,6 +3,8 @@ import { api } from "./api";
 import type {
   Clip,
   ExportInfo,
+  ReplacementMode,
+  ReplacementPlan,
   ImportResult,
   MediaInfo,
   PackageInfo,
@@ -149,6 +151,7 @@ interface EditorState {
   selectedClipId: string | null;
   exportJob: ExportInfo | null;
   packageJob: PackageInfo | null;
+  replacement: { mediaId: string; plan: ReplacementPlan } | null;
   message: string | null;
   busy: boolean;
   canUndo: boolean;
@@ -182,6 +185,10 @@ interface EditorState {
   pollPackage: () => Promise<void>;
   cancelPackage: () => Promise<void>;
   importPackage: (file: File) => Promise<void>;
+  prepareReplacement: (mediaId: string, file: File) => Promise<void>;
+  setReplacementMode: (mode: ReplacementMode) => Promise<void>;
+  confirmReplacement: (clipIds: string[]) => Promise<void>;
+  closeReplacement: () => void;
   setMessage: (message: string | null) => void;
 }
 
@@ -271,6 +278,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   selectedClipId: null,
   exportJob: null,
   packageJob: null,
+  replacement: null,
   message: null,
   busy: false,
   canUndo: false,
@@ -663,6 +671,92 @@ export const useEditor = create<EditorState>((set, get) => ({
     await get().pollPackage();
   },
 
+  prepareReplacement: async (mediaId, file) => {
+    const token = sessionToken;
+    const { project } = get();
+    if (!project) return editRejected(set, "请先新建或打开一个工程");
+    set({ busy: true, message: `正在读取替代文件 ${file.name}…` });
+    try {
+      // The replacement is imported as a normal library entry first:
+      // identical content dedups by hash, same-name different-content
+      // gets its own id and is never confused with the original.
+      const info = await api.uploadMedia(file);
+      set((state) => ({ media: upsertMediaItem(state.media, info) }));
+      void get().loadMedia();
+      const plan = await api.previewReplacement(project.id, {
+        media_id: mediaId,
+        replacement_media_id: info.id,
+        mode: "keep_source",
+      });
+      if (token !== sessionToken || get().project?.id !== project.id) return;
+      set({
+        replacement: { mediaId, plan },
+        busy: false,
+        message: `已生成替换预览：${info.filename}，可切换模式并选择要替换的片段`,
+      });
+    } catch (error) {
+      set({ busy: false, message: `替换预览失败：${(error as Error).message}` });
+    }
+  },
+
+  setReplacementMode: async (mode) => {
+    const token = sessionToken;
+    const { project, replacement } = get();
+    if (!project || !replacement) return;
+    try {
+      const plan = await api.previewReplacement(project.id, {
+        media_id: replacement.mediaId,
+        replacement_media_id: replacement.plan.replacement_media_id,
+        mode,
+      });
+      if (token !== sessionToken) return;
+      set({ replacement: { mediaId: replacement.mediaId, plan } });
+    } catch (error) {
+      set({ message: `更新替换预览失败：${(error as Error).message}` });
+    }
+  },
+
+  confirmReplacement: async (clipIds) => {
+    const token = sessionToken;
+    const { project, replacement } = get();
+    if (!project || !replacement) return;
+    const plan = replacement.plan;
+    const blocked = plan.clips.filter(
+      (entry) => clipIds.includes(entry.clip_id) && entry.blocked,
+    );
+    if (blocked.length > 0) {
+      return editRejected(
+        set,
+        `有 ${blocked.length} 个片段因${blocked[0].reasons[0]}无法替换，请取消勾选或更换替代文件`,
+      );
+    }
+    if (clipIds.length === 0) {
+      return editRejected(set, "未选择任何片段，替换没有生效");
+    }
+    set({ busy: true });
+    try {
+      const result = await api.applyReplacement(project.id, {
+        media_id: replacement.mediaId,
+        replacement_media_id: plan.replacement_media_id,
+        mode: plan.mode as ReplacementMode,
+        clip_ids: clipIds,
+      });
+      if (token !== sessionToken || get().project?.id !== project.id) return;
+      // Apply as a real edit so it is undoable (撤销替换素材).
+      commitEdit(get, set, result.project.clips, get().selectedClipId, "替换素材");
+      set({
+        replacement: null,
+        timeline: result.timeline,
+        busy: false,
+        message: `已替换 ${clipIds.length} 个片段的素材，可撤销；未选择的片段保持不变`,
+      });
+    } catch (error) {
+      set({ busy: false, message: `替换失败：${(error as Error).message}` });
+    }
+  },
+
+  closeReplacement: () => set({ replacement: null }),
+
   importPackage: async (file) => {
     set({ busy: true, message: `正在导入工程包 ${file.name}…` });
     try {
@@ -856,6 +950,7 @@ export function __resetEditorForTests() {
     timeline: null,
     selectedClipId: null,
     exportJob: null,
+    replacement: null,
     message: null,
     busy: false,
     canUndo: false,

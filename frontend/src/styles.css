@@ -231,3 +231,61 @@ input, select {
   z-index: 10;
 }
 .loading { color: var(--muted); text-align: center; }
+
+.replacement-panel h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.replacement-panel .missing-list,
+.replacement-panel .replacement-clips {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.replacement-panel .missing-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.replacement-panel .replacement-clips li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.replacement-panel .replacement-clips li.blocked {
+  opacity: 0.75;
+}
+.replacement-panel .replacement-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.replacement-panel .replacement-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+.replacement-panel .replacement-mode label,
+.replacement-panel .replacement-clips label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.replacement-panel .replacement-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.replacement-panel .meta.warn {
+  color: #d97706;
+}
+.replacement-panel .meta.ok {
+  color: #059669;
+}

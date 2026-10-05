@@ -18,6 +18,12 @@ from .exporter import manager as export_manager
 from .packager import PackageInvalid, import_package
 from .packager import manager as package_manager
 from .models import ExportPayload, ImportResult, Project, ProjectPayload
+from .replacement import (
+    ReplacementInvalid,
+    ReplacementRequest,
+    apply_replacement,
+    build_plan,
+)
 from .samples import ensure_samples
 from .store import list_projects, load_project, media_path, save_project
 from .timeline import compute_timeline
@@ -210,6 +216,37 @@ def import_project(file: UploadFile = File(...)) -> dict:
     except PackageInvalid as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return ImportResult(project=project, report=report).model_dump()
+
+
+def _load_project_or_404(project_id: str) -> Project:
+    project = load_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="工程不存在")
+    return project
+
+
+@app.post("/api/projects/{project_id}/replacements/preview")
+def preview_replacement(project_id: str, payload: ReplacementRequest) -> dict:
+    project = _load_project_or_404(project_id)
+    try:
+        plan = build_plan(project, payload)
+    except ReplacementInvalid as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return plan.model_dump()
+
+
+@app.post("/api/projects/{project_id}/replacements/apply")
+def apply_replacement_route(project_id: str, payload: ReplacementRequest) -> dict:
+    project = _load_project_or_404(project_id)
+    try:
+        updated = apply_replacement(project, payload)
+    except ReplacementInvalid as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    updated.version += 1
+    updated.updated_at = _now()
+    save_project(updated)
+    timeline = compute_timeline(updated, media_service.load_index())
+    return {"project": updated.model_dump(), "timeline": timeline.model_dump()}
 
 
 @app.get("/api/exports/{job_id}/download")

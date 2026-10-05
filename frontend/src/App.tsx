@@ -3,6 +3,7 @@ import { ExportPanel } from "./components/ExportPanel";
 import { MediaLibrary } from "./components/MediaLibrary";
 import { Preview } from "./components/Preview";
 import { ProjectBar } from "./components/ProjectBar";
+import { ReplacementPanel } from "./components/ReplacementPanel";
 import { Timeline } from "./components/Timeline";
 import { useEditor } from "./store";
 
@@ -41,6 +42,7 @@ export default function App() {
         </aside>
         <section className="main-area">
           <Preview />
+          <ReplacementPanel />
           <Timeline />
           {!project && <div className="loading">正在初始化或打开工程…</div>}
         </section>

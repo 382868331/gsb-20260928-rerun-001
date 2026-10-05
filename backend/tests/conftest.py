@@ -137,6 +137,22 @@ class DirectClient:
             except HTTPException as exc:
                 raise HTTPError(exc.status_code, exc.detail)
             return Response(result)
+        m = re.fullmatch(r"/api/projects/([^/]+)/replacements/preview", path)
+        if m:
+            from app.replacement import ReplacementRequest
+
+            payload = ReplacementRequest.model_validate(json_body or {})
+            return self._call(
+                api_module.preview_replacement, project_id=m.group(1), payload=payload
+            )
+        m = re.fullmatch(r"/api/projects/([^/]+)/replacements/apply", path)
+        if m:
+            from app.replacement import ReplacementRequest
+
+            payload = ReplacementRequest.model_validate(json_body or {})
+            return self._call(
+                api_module.apply_replacement_route, project_id=m.group(1), payload=payload
+            )
         raise AssertionError(f"unknown POST {path}")
 
     async def _upload_async(self, upload):

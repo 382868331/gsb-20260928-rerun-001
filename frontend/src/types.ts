@@ -4,6 +4,7 @@ export interface MediaInfo {
   duration: number;
   width: number | null;
   height: number | null;
+  fps: number | null;
   has_audio: boolean;
   is_sample: boolean;
 }
@@ -118,4 +119,41 @@ export interface ImportReport {
 export interface ImportResult {
   project: Project;
   report: ImportReport;
+}
+
+export type ReplacementMode = "keep_source" | "keep_duration";
+
+export interface MediaSummary {
+  id: string;
+  filename: string;
+  duration: number;
+  fps: number | null;
+  has_audio: boolean;
+}
+
+export interface ReplacementClipPlan {
+  clip_id: string;
+  selected: boolean;
+  blocked: boolean;
+  reasons: string[];
+  source_in: number;
+  source_out: number;
+  speed_segments: SpeedSegment[];
+  rendered_before: number;
+  rendered_after: number;
+}
+
+export interface ReplacementPlan {
+  media_id: string;
+  replacement_media_id: string;
+  mode: ReplacementMode;
+  identical_to_original: boolean;
+  original: MediaSummary | null;
+  replacement: MediaSummary;
+  clips: ReplacementClipPlan[];
+}
+
+export interface ReplacementApplyResult {
+  project: Project;
+  timeline: Timeline;
 }

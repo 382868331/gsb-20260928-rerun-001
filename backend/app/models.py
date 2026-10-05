@@ -73,6 +73,7 @@ class MediaInfo(BaseModel):
     duration: float
     width: int | None = None
     height: int | None = None
+    fps: float | None = None
     has_audio: bool
     is_sample: bool = False
     sha256: str | None = None
