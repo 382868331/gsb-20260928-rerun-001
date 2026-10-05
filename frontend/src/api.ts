@@ -5,6 +5,9 @@ import type {
   MediaInfo,
   PackageInfo,
   Project,
+  ReplacementPreview,
+  ReplacementRequest,
+  ReplacementResult,
   Timeline,
 } from "./types";
 
@@ -91,4 +94,14 @@ export const api = {
     return response.json();
   },
   mediaStreamUrl: (mediaId: string) => `/api/media/${mediaId}/stream`,
+  previewReplacement: (projectId: string, body: ReplacementRequest) =>
+    request<ReplacementPreview>(`/api/projects/${projectId}/replacement/preview`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  confirmReplacement: (projectId: string, body: ReplacementRequest) =>
+    request<ReplacementResult>(`/api/projects/${projectId}/replacement/confirm`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };

@@ -73,6 +73,7 @@ class MediaInfo(BaseModel):
     duration: float
     width: int | None = None
     height: int | None = None
+    fps: float | None = None
     has_audio: bool
     is_sample: bool = False
     sha256: str | None = None
@@ -144,3 +145,57 @@ class ExportInfo(BaseModel):
     error: str | None = None
     created_at: str
     finished_at: str | None = None
+
+
+class ReplacementRequest(BaseModel):
+    # The media currently referenced by the clips (usually missing).
+    media_id: str
+    # Media already in the library to use instead. Matching is by id /
+    # content hash only -- a same-name file is never assumed identical.
+    replacement_media_id: str
+    # keep_source: keep every source timestamp (trim/speed boundaries)
+    #   unchanged; requires the replacement to cover the same source
+    #   range and keeps the same playback rates.
+    # keep_duration: remap the source range proportionally into the
+    #   replacement and scale playback rates by the same factor, so the
+    #   rendered timeline duration stays exactly the same.
+    mode: Literal["keep_source", "keep_duration"] = "keep_source"
+    # Restrict the replacement to these clips; clips referencing the
+    # same media but not listed here keep pointing at the old media.
+    clip_ids: list[str] | None = None
+
+
+class ClipReplacementPlan(BaseModel):
+    clip_id: str
+    selected: bool
+    status: Literal["ok", "blocked"]
+    reasons: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    source_in_before: float
+    source_out_before: float
+    source_in_after: float
+    source_out_after: float
+    rendered_before: float
+    rendered_after: float
+    speed_segments_after: list[SpeedSegment] = Field(default_factory=list)
+
+
+class ReplacementPreview(BaseModel):
+    media_id: str
+    replacement: MediaInfo
+    original: MediaInfo | None
+    mode: Literal["keep_source", "keep_duration"]
+    clips: list[ClipReplacementPlan]
+    timeline_duration_before: float
+    timeline_duration_after: float
+
+
+class BlockedClip(BaseModel):
+    clip_id: str
+    reasons: list[str]
+
+
+class ReplacementResult(BaseModel):
+    project: Project
+    applied: list[str]
+    blocked: list[BlockedClip]

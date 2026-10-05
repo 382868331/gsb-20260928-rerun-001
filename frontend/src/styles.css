@@ -231,3 +231,59 @@ input, select {
   z-index: 10;
 }
 .loading { color: var(--muted); text-align: center; }
+.replacement .field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.replacement .radio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: normal;
+  color: var(--text-dim, #aab);
+}
+
+.replacement .row-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.replacement-preview ul {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.replacement-preview li {
+  font-size: 12px;
+  border-left: 3px solid #4a7;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+}
+
+.replacement-preview li.blocked {
+  border-left-color: #d55;
+}
+
+.replacement-preview .reason,
+.replacement-preview .note {
+  display: block;
+  font-size: 12px;
+}
+
+.replacement-preview .reason {
+  color: #e88;
+}
+
+.replacement-preview .note {
+  color: #9ab;
+}

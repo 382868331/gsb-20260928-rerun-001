@@ -18,6 +18,7 @@ from app import api as api_module  # noqa: E402
 from app import media as media_module  # noqa: E402
 from app import samples as samples_module  # noqa: E402
 from app.models import ExportPayload, ProjectPayload  # noqa: E402
+from app.models import ReplacementRequest  # noqa: E402
 from app import store as store_module  # noqa: E402
 from app import exporter as exporter_module  # noqa: E402
 from app import packager as packager_module  # noqa: E402
@@ -125,6 +126,15 @@ class DirectClient:
         m = re.fullmatch(r"/api/projects/([^/]+)/packages", path)
         if m:
             return self._call(api_module.start_package, project_id=m.group(1))
+        m = re.fullmatch(r"/api/projects/([^/]+)/replacement/(preview|confirm)", path)
+        if m:
+            payload = ReplacementRequest.model_validate(json_body or {})
+            handler = (
+                api_module.preview_replacement
+                if m.group(2) == "preview"
+                else api_module.confirm_replacement
+            )
+            return self._call(handler, project_id=m.group(1), payload=payload)
         m = re.fullmatch(r"/api/packages/([^/]+)/cancel", path)
         if m:
             return self._call(api_module.cancel_package, job_id=m.group(1))

@@ -3,6 +3,7 @@ import { ExportPanel } from "./components/ExportPanel";
 import { MediaLibrary } from "./components/MediaLibrary";
 import { Preview } from "./components/Preview";
 import { ProjectBar } from "./components/ProjectBar";
+import { ReplacementPanel } from "./components/ReplacementPanel";
 import { Timeline } from "./components/Timeline";
 import { useEditor } from "./store";
 
@@ -37,6 +38,7 @@ export default function App() {
       <main className="workspace">
         <aside className="sidebar">
           <MediaLibrary />
+          <ReplacementPanel />
           <ExportPanel />
         </aside>
         <section className="main-area">

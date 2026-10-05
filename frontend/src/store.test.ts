@@ -14,6 +14,7 @@ vi.mock("./api", () => ({
     getExport: vi.fn(),
     cancelExport: vi.fn(),
     listExports: vi.fn(),
+    confirmReplacement: vi.fn(),
     mediaStreamUrl: (id: string) => `/api/media/${id}/stream`,
   },
 }));
@@ -49,6 +50,7 @@ function makeMedia(id: string, filename = `${id}.mp4`): MediaInfo {
     duration: 3,
     width: 320,
     height: 180,
+    fps: 30,
     has_audio: true,
     is_sample: false,
   };
@@ -353,5 +355,55 @@ describe("工程编辑状态隔离", () => {
     useEditor.getState().undo();
     state = useEditor.getState();
     expect(state.project?.clips.map((clip) => clip.id)).toEqual([clipId]);
+  });
+});
+
+describe("缺失素材替换", () => {
+  it("确认替换形成可撤销编辑，撤销后恢复片段顺序与变速映射", async () => {
+    const clips = [
+      {
+        ...makeClip("c1", "m1"),
+        speed_segments: [{ source_start: 1, source_end: 2, rate: 2 }],
+      },
+      {
+        ...makeClip("c2", "m1"),
+        speed_segments: [{ source_start: 0.5, source_end: 1.5, rate: 0.5 }],
+      },
+    ];
+    const project = makeProject("p-rep", clips);
+    serverProjects.set(project.id, project);
+    serverMedia.push(makeMedia("m1"), makeMedia("m2"));
+    await useEditor.getState().loadMedia();
+    await useEditor.getState().openProject("p-rep");
+    const before = structuredClone(useEditor.getState().project!.clips);
+
+    // 服务器只替换选定的 c1；共享同一素材的 c2 保持不变。
+    const replaced = [{ ...clips[0], media_id: "m2" }, clips[1]];
+    mockApi.confirmReplacement.mockResolvedValue({
+      project: { ...project, clips: replaced, version: 2 },
+      applied: ["c1"],
+      blocked: [],
+    });
+    const result = await useEditor.getState().confirmReplacement({
+      media_id: "m1",
+      replacement_media_id: "m2",
+      mode: "keep_source",
+      clip_ids: ["c1"],
+    });
+
+    expect(result?.applied).toEqual(["c1"]);
+    const after = useEditor.getState().project!.clips;
+    expect(after[0].media_id).toBe("m2");
+    expect(after[1].media_id).toBe("m1");
+    expect(useEditor.getState().canUndo).toBe(true);
+
+    useEditor.getState().undo();
+    const restored = useEditor.getState().project!.clips;
+    expect(restored).toEqual(before);
+    // 本地时间线镜像恢复片段顺序与音画共用的源时间映射。
+    const timeline = useEditor.getState().timeline!;
+    expect(timeline.clips.map((clip) => clip.clip_id)).toEqual(["c1", "c2"]);
+    expect(timeline.clips[0].speed_segments.map((seg) => seg.rate)).toEqual([1, 2]);
+    expect(timeline.clips[1].speed_segments.map((seg) => seg.rate)).toEqual([1, 0.5, 1]);
   });
 });

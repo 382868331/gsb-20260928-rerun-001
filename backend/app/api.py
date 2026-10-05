@@ -18,6 +18,8 @@ from .exporter import manager as export_manager
 from .packager import PackageInvalid, import_package
 from .packager import manager as package_manager
 from .models import ExportPayload, ImportResult, Project, ProjectPayload
+from .models import ReplacementRequest, ReplacementResult
+from . import replacement as replacement_service
 from .samples import ensure_samples
 from .store import list_projects, load_project, media_path, save_project
 from .timeline import compute_timeline
@@ -134,6 +136,36 @@ def project_timeline(project_id: str) -> dict:
         raise HTTPException(status_code=404, detail="工程不存在")
     timeline = compute_timeline(project, media_service.load_index())
     return timeline.model_dump()
+
+
+@app.post("/api/projects/{project_id}/replacement/preview")
+def preview_replacement(project_id: str, payload: ReplacementRequest) -> dict:
+    project = load_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="工程不存在")
+    try:
+        preview = replacement_service.preview_replacement(project, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return preview.model_dump()
+
+
+@app.post("/api/projects/{project_id}/replacement/confirm")
+def confirm_replacement(project_id: str, payload: ReplacementRequest) -> dict:
+    project = load_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="工程不存在")
+    try:
+        updated, applied, blocked = replacement_service.apply_replacement(project, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if applied:
+        updated.version = project.version + 1
+        updated.updated_at = _now()
+        save_project(updated)
+    return ReplacementResult(
+        project=updated, applied=applied, blocked=blocked
+    ).model_dump()
 
 
 @app.post("/api/projects/{project_id}/exports")

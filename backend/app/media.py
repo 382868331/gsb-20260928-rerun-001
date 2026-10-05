@@ -41,15 +41,28 @@ def probe(path: Path) -> MediaInfo:
     if video is None:
         raise ValueError("文件中没有视频轨道")
     duration = float(data["format"]["duration"])
+    fps = _parse_frame_rate(video.get("avg_frame_rate") or video.get("r_frame_rate"))
     return MediaInfo(
         id=path.name,
         filename=path.name,
         duration=duration,
         width=int(video["width"]) if video.get("width") else None,
         height=int(video["height"]) if video.get("height") else None,
+        fps=fps,
         has_audio=has_audio,
         is_sample=False,
     )
+
+
+def _parse_frame_rate(value) -> float | None:
+    if not value or not isinstance(value, str) or "/" not in value:
+        return None
+    try:
+        num, den = value.split("/", 1)
+        rate = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return round(rate, 3) if rate > 0 else None
 
 
 def load_index() -> dict[str, MediaInfo]:

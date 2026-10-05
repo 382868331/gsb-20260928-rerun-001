@@ -7,6 +7,8 @@ import type {
   MediaInfo,
   PackageInfo,
   Project,
+  ReplacementRequest,
+  ReplacementResult,
   Timeline,
   TimelineClip,
   TimelineSpeedSegment,
@@ -182,6 +184,7 @@ interface EditorState {
   pollPackage: () => Promise<void>;
   cancelPackage: () => Promise<void>;
   importPackage: (file: File) => Promise<void>;
+  confirmReplacement: (request: ReplacementRequest) => Promise<ReplacementResult | null>;
   setMessage: (message: string | null) => void;
 }
 
@@ -681,6 +684,49 @@ export const useEditor = create<EditorState>((set, get) => ({
       set({ message: `工程包导入失败：${(error as Error).message}` });
     } finally {
       set({ busy: false });
+    }
+  },
+  confirmReplacement: async (request) => {
+    const { project } = get();
+    if (!project) {
+      editRejected(set, "请先新建或打开一个工程");
+      return null;
+    }
+    const token = sessionToken;
+    set({ busy: true });
+    try {
+      const result = await api.confirmReplacement(project.id, request);
+      if (token !== sessionToken || get().project?.id !== project.id) return null;
+      if (result.applied.length > 0) {
+        // A confirmed replacement is a real, undoable edit: it goes
+        // through the same history/autosave path as trims and cuts.
+        commitEdit(get, set, result.project.clips, get().selectedClipId, "替换素材");
+        set({ project: { ...get().project!, version: result.project.version } });
+      }
+      const parts: string[] = [];
+      if (result.applied.length > 0) {
+        parts.push(`已替换 ${result.applied.length} 个片段的素材，可撤销`);
+      }
+      if (result.blocked.length > 0) {
+        parts.push(
+          `${result.blocked.length} 个片段被阻止（${result.blocked
+            .map((entry) => entry.reasons.join("；"))
+            .join("；")}），已保持原样`,
+        );
+      }
+      if (result.applied.length === 0 && result.blocked.length === 0) {
+        parts.push("没有引用该素材的片段需要替换");
+      }
+      set({ message: parts.join("，") });
+      await get().refreshTimeline(token);
+      return result;
+    } catch (error) {
+      if (token === sessionToken) {
+        set({ message: `素材替换失败：${(error as Error).message}` });
+      }
+      return null;
+    } finally {
+      if (token === sessionToken) set({ busy: false });
     }
   },
 }));
